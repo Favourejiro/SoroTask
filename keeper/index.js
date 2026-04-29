@@ -180,8 +180,8 @@ async function main() {
       const taskIds = registry.getTaskIds();
       logger.info("Checking tasks", { taskCount: taskIds.length });
 
-      // Poll for due tasks
-      const dueTaskIds = await poller.pollDueTasks(taskIds);
+      // Poll for due tasks using the registry's cached/reconciled state for efficiency
+      const dueTaskIds = await poller.pollDueTasks(taskIds, { registry, trustRegistry: true });
 
       if (dueTaskIds.length > 0) {
         const lockSnapshot = idempotencyGuard.getSnapshot();
@@ -222,7 +222,14 @@ async function main() {
   setTimeout(async () => {
     try {
       const taskIds = registry.getTaskIds();
-      const dueTaskIds = await poller.pollDueTasks(taskIds);
+      const startTime = Date.now();
+      const dueTaskIds = await poller.pollDueTasks(taskIds, { registry, trustRegistry: true });
+      const duration = Date.now() - startTime;
+      logger.info('Initial poll complete (Fast Cold Start)', { 
+        durationMs: duration, 
+        taskCount: taskIds.length,
+        dueCount: dueTaskIds.length
+      });
       if (dueTaskIds.length > 0) {
         await queue.enqueue(dueTaskIds, executeTask);
       }

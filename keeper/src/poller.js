@@ -100,15 +100,24 @@ class TaskPoller {
       // which might require additional RPC calls or using ledger.timestamp from contract context
       this.logger.info('Current ledger sequence', { sequence: currentTimestamp });
 
-      // Process tasks in parallel with concurrency control
-      const taskChecks = taskIds.map(taskId =>
-        this.readLimit(async () => {
+      // Process tasks: use cache immediately if possible, otherwise use rate-limited RPC
+      const taskChecks = taskIds.map(taskId => {
+        // Optimization: if we can trust the registry and the task is there, bypass rate limiter
+        if (options.registry && (options.trustRegistry || options.preferCache)) {
+          const cachedTask = options.registry.tasks.get(taskId);
+          if (cachedTask && cachedTask.status !== 'registered') {
+            return this.checkTask(taskId, currentTimestamp, options.registry, options);
+          }
+        }
+
+        // Fallback to rate-limited RPC check
+        return this.readLimit(async () => {
           const startedAt = Date.now();
-          const result = await this.checkTask(taskId, currentTimestamp);
+          const result = await this.checkTask(taskId, currentTimestamp, options.registry, options);
           rpcLatencies.push(Date.now() - startedAt);
           return result;
-        }),
-      );
+        });
+      });
 
       const results = await Promise.allSettled(taskChecks);
 
@@ -173,10 +182,24 @@ class TaskPoller {
      * @param {number} currentTimestamp - Current ledger timestamp
      * @returns {Promise<{isDue: boolean, taskId: number, reason?: string}>}
      */
-  async checkTask(taskId, currentTimestamp, registry) {
+  async checkTask(taskId, currentTimestamp, registry, options = {}) {
     try {
-      // Read task configuration from contract using view call
-      const taskConfig = await this.getTaskConfig(taskId);
+      let taskConfig = null;
+
+      // Try to get from registry first if trusted
+      if (registry && (options.trustRegistry || options.preferCache)) {
+        taskConfig = registry.tasks.get(taskId);
+        if (taskConfig && taskConfig.status !== 'registered') { // 'registered' means we only know it exists but don't have full config
+          this.logger.debug('Using cached task config from registry', { taskId });
+        } else {
+          taskConfig = null; // Force fetch if only basic info exists
+        }
+      }
+
+      // If not in registry or not trusted, fetch from contract
+      if (!taskConfig) {
+        taskConfig = await this.getTaskConfig(taskId);
+      }
 
       if (!taskConfig) {
         this.logger.warn('Task not found (may have been deregistered)', { taskId });
