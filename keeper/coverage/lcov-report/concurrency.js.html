@@ -232,15 +232,15 @@
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
-<span class="cline-any cline-no">&nbsp;</span>
-<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-yes">25x</span>
+<span class="cline-any cline-yes">3x</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
-<span class="cline-any cline-no">&nbsp;</span>
-<span class="cline-any cline-no">&nbsp;</span>
-<span class="cline-any cline-no">&nbsp;</span>
-<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-yes">25x</span>
+<span class="cline-any cline-yes">25x</span>
+<span class="cline-any cline-yes">25x</span>
+<span class="cline-any cline-yes">25x</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
@@ -349,15 +349,15 @@ function createRateLimiter(options = <span class="branch-0 cbranch-no" title="br
         }
 &nbsp;
         // Call onThrottle callback if provided
-<span class="cstat-no" title="statement not covered" >        if (options.onThrottle) {</span>
-<span class="cstat-no" title="statement not covered" >          options.onThrottle({ name, rps, queueDepth: queue.length });</span>
+        if (options.onThrottle) {
+          options.onThrottle({ name, rps, queueDepth: queue.length });
         }
 &nbsp;
         // Schedule next attempt based on when the oldest timestamp will expire
-        const oldestTimestamp = <span class="cstat-no" title="statement not covered" >requestTimestamps[0];</span>
-        const delay = <span class="cstat-no" title="statement not covered" >Math.max(0, 1000 - (now - oldestTimestamp) + 1);</span> // +1ms buffer
-<span class="cstat-no" title="statement not covered" >        setTimeout(next, delay);</span>
-<span class="cstat-no" title="statement not covered" >        return;</span>
+        const oldestTimestamp = requestTimestamps[0];
+        const delay = Math.max(0, 1000 - (now - oldestTimestamp) + 1); // +1ms buffer
+        setTimeout(next, delay);
+        return;
       }
     }
 &nbsp;

@@ -392,7 +392,7 @@
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-yes">24x</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
-<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-yes">1x</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-yes">2x</span>
@@ -407,7 +407,7 @@
 <span class="cline-any cline-yes">3x</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
-<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-yes">1x</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
@@ -420,7 +420,7 @@
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
-<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-yes">1x</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
@@ -430,8 +430,8 @@
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
-<span class="cline-any cline-no">&nbsp;</span>
-<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-yes">2x</span>
+<span class="cline-any cline-yes">2x</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
@@ -439,7 +439,7 @@
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
-<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-yes">3x</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
@@ -447,7 +447,7 @@
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
-<span class="cline-any cline-no">&nbsp;</span>
+<span class="cline-any cline-yes">1x</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
 <span class="cline-any cline-neutral">&nbsp;</span>
@@ -605,8 +605,8 @@ function createLogger(module) {
     error: (msg, meta = <span class="branch-0 cbranch-no" title="branch not covered" >{})</span> =&gt; {
       child.error(meta, msg);
     },
-    fatal: <span class="fstat-no" title="function not covered" >(m</span>sg, meta = <span class="branch-0 cbranch-no" title="branch not covered" >{})</span> =&gt; {
-<span class="cstat-no" title="statement not covered" >      child.fatal(meta, msg);</span>
+    fatal: (msg, meta = <span class="branch-0 cbranch-no" title="branch not covered" >{})</span> =&gt; {
+      child.fatal(meta, msg);
     },
     // Expose the raw pino logger for advanced use cases
     raw: child,
@@ -618,8 +618,8 @@ function createLogger(module) {
  * @param {string} module - Module name
  * @returns {Object} Child logger
  */
-function <span class="fstat-no" title="function not covered" >createChildLogger(</span>module) {
-<span class="cstat-no" title="statement not covered" >  return createLogger(module);</span>
+function createChildLogger(module) {
+  return createLogger(module);
 }
 &nbsp;
 /**
@@ -628,25 +628,25 @@ function <span class="fstat-no" title="function not covered" >createChildLogger(
  *
  * @param {Object} options - Pino options
  */
-function <span class="fstat-no" title="function not covered" >reinitializeLogger(</span>options = <span class="branch-0 cbranch-no" title="branch not covered" >{})</span> {
-  const { destination, ...loggerOptions } = <span class="cstat-no" title="statement not covered" >options;</span>
-<span class="cstat-no" title="statement not covered" >  baseLogger = createBaseLogger(loggerOptions, destination);</span>
+function reinitializeLogger(options = <span class="branch-0 cbranch-no" title="branch not covered" >{})</span> {
+  const { destination, ...loggerOptions } = options;
+  baseLogger = createBaseLogger(loggerOptions, destination);
 }
 &nbsp;
 /**
  * Get the current log level
  * @returns {string} Current log level
  */
-function <span class="fstat-no" title="function not covered" >getLogLevel(</span>) {
-<span class="cstat-no" title="statement not covered" >  return getBaseLogger().level;</span>
+function getLogLevel() {
+  return getBaseLogger().level;
 }
 &nbsp;
 /**
  * Set the log level dynamically
  * @param {string} level - New log level (trace, debug, info, warn, error, fatal)
  */
-function <span class="fstat-no" title="function not covered" >setLogLevel(</span>level) {
-<span class="cstat-no" title="statement not covered" >  getBaseLogger().level = level;</span>
+function setLogLevel(level) {
+  getBaseLogger().level = level;
 }
 &nbsp;
 // Export the public API
