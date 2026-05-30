@@ -19,6 +19,8 @@ const { GracefulShutdownManager } = require("./src/gracefulShutdown");
 const { createDefaultFilterChain } = require("./src/taskFilter");
 const { WebhookAuthProtocol, InMemoryReplayStore } = require("./src/webhookAuth");
 const { WebhookTriggerHandler } = require("./src/webhookTrigger");
+const { MultiRegionRPCClient } = require("./src/disasterRecovery");
+const { KeeperP2PNetwork } = require("./src/p2pNetwork");
 
 // Create root logger for the main module
 const logger = createLogger("keeper");
@@ -56,10 +58,6 @@ async function main() {
   }
 
   const { keypair } = keeperData;
-  
-  // Load balanced RPC server creation
-  const { createRpc } = require("./src/rpc");
-  const server = await createRpc(config, createLogger("rpc"));
   const historyManager = new HistoryManager({
     logger: createLogger("history"),
   });
@@ -102,6 +100,25 @@ async function main() {
   });
 
   metricsServer.start();
+
+  // Keep the existing RPC surface while adding explicit multi-region failover.
+  const failoverClient = new MultiRegionRPCClient(config.rpcUrls, {
+    logger: createLogger("rpc-failover"),
+    metrics: metricsServer,
+    failureThreshold: config.rpcFailoverFailureThreshold,
+    cooldownMs: config.rpcFailoverCooldownMs,
+    healthCheckIntervalMs: config.rpcFailoverHealthCheckIntervalMs,
+    serverFactory: (url) => new Server(url),
+  });
+  if (config.rpcFailoverEnabled) {
+    failoverClient.start();
+    logger.info("RPC failover enabled", {
+      endpointCount: config.rpcUrls.length,
+      activeRegion: failoverClient.getStateSnapshot().activeRegion,
+    });
+  }
+  metricsServer.setFailoverStateProvider(() => failoverClient.getStateSnapshot());
+  const server = failoverClient.getServerFacade();
 
   // Perform startup validation to fail fast on configuration errors
   const validator = new StartupValidator(
@@ -362,6 +379,11 @@ async function main() {
   shutdownManager.registerResource("rpc-server", async () => {
     logger.info("Closing RPC server connection");
     // Server doesn't have explicit close, but we log it
+  });
+
+  shutdownManager.registerResource("rpc-failover", async () => {
+    logger.info("Stopping RPC failover manager");
+    failoverClient.stop();
   });
 
   // Register idempotency guard persistence

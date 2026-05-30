@@ -49,8 +49,19 @@ function loadConfig() {
     throw new Error('INBOUND_WEBHOOK_SECRET or INBOUND_WEBHOOK_SECRETS is required when INBOUND_WEBHOOKS_ENABLED=true');
   }
 
+  const rpcUrlList = parseList(process.env.SOROBAN_RPC_URLS);
+  const rpcUrls = Array.from(new Set([
+    process.env.SOROBAN_RPC_URL,
+    ...rpcUrlList,
+  ].filter(Boolean)));
+
   return {
     rpcUrl: process.env.SOROBAN_RPC_URL,
+    rpcUrls,
+    rpcFailoverEnabled: parseBoolean(process.env.RPC_FAILOVER_ENABLED, rpcUrls.length > 1),
+    rpcFailoverFailureThreshold: parseInteger(process.env.RPC_FAILOVER_FAILURE_THRESHOLD, 3),
+    rpcFailoverCooldownMs: parseInteger(process.env.RPC_FAILOVER_COOLDOWN_MS, 30000),
+    rpcFailoverHealthCheckIntervalMs: parseInteger(process.env.RPC_FAILOVER_HEALTH_CHECK_INTERVAL_MS, 15000),
     networkPassphrase: process.env.NETWORK_PASSPHRASE,
     keeperSecret: process.env.KEEPER_SECRET,
     contractId: process.env.CONTRACT_ID,

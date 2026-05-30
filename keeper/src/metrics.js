@@ -27,6 +27,13 @@ class Metrics {
       severity: 'none',
       observedAt: null,
     };
+    this.failoverState = {
+      activeIndex: 0,
+      activeRegion: 'region-0',
+      healthyEndpoints: 1,
+      totalEndpoints: 1,
+      endpoints: [],
+    };
     this.reset();
   }
 
@@ -44,6 +51,8 @@ class Metrics {
       webhookAcceptedTotal: 0,
       webhookRejectedTotal: 0,
       webhookReplayRejectedTotal: 0,
+      failoverEventsTotal: 0,
+      failoverSwitchesTotal: 0,
     };
     this.gauges = {
       avgFeePaidXlm: 0,
@@ -107,6 +116,16 @@ class Metrics {
     this.driftState = { ...this.driftState, ...state };
   }
 
+  updateFailoverState(state = {}) {
+    this.failoverState = {
+      ...this.failoverState,
+      ...state,
+      endpoints: Array.isArray(state.endpoints)
+        ? state.endpoints
+        : this.failoverState.endpoints,
+    };
+  }
+
   snapshot() {
     return {
       ...this.counters,
@@ -114,6 +133,7 @@ class Metrics {
       admin: { ...this.adminState },
       shard: { ...this.shardState },
       drift: { ...this.driftState },
+      failover: { ...this.failoverState },
     };
   }
 
@@ -169,6 +189,8 @@ class MetricsServer {
     this.controlStateProvider = options.controlStateProvider || null;
     this.controlActionHandler = options.controlActionHandler || null;
     this.historyManager = options.historyManager || null;
+    this.p2pStateProvider = options.p2pStateProvider || null;
+    this.failoverStateProvider = options.failoverStateProvider || null;
     this.webhookHandler = options.webhookHandler || null;
     this.webhookPath = options.webhookPath || '/webhooks/task-executions';
     this.register = new promClient.Registry();
@@ -190,6 +212,14 @@ class MetricsServer {
   setWebhookHandler(handler, path = this.webhookPath) {
     this.webhookHandler = handler;
     this.webhookPath = path;
+  }
+
+  setP2PStateProvider(provider) {
+    this.p2pStateProvider = provider;
+  }
+
+  setFailoverStateProvider(provider) {
+    this.failoverStateProvider = provider;
   }
 
   initPrometheusMetrics() {
@@ -240,6 +270,16 @@ class MetricsServer {
     this.promWebhookReplayRejected = new promClient.Counter({
       name: 'keeper_webhook_replay_rejected_total',
       help: 'Total inbound webhook requests rejected by replay protection',
+      registers: [this.register],
+    });
+    this.promFailoverEvents = new promClient.Counter({
+      name: 'keeper_rpc_failover_events_total',
+      help: 'Total RPC failover events due to endpoint failures',
+      registers: [this.register],
+    });
+    this.promFailoverSwitches = new promClient.Counter({
+      name: 'keeper_rpc_failover_switches_total',
+      help: 'Total active RPC endpoint switches',
       registers: [this.register],
     });
     this.promAvgFee = new promClient.Gauge({
@@ -314,6 +354,21 @@ class MetricsServer {
       help: 'Number of tasks currently showing critical recurring drift',
       registers: [this.register],
     });
+    this.promFailoverActiveIndex = new promClient.Gauge({
+      name: 'keeper_rpc_failover_active_endpoint_index',
+      help: 'Current active endpoint index for multi-region RPC failover',
+      registers: [this.register],
+    });
+    this.promFailoverHealthyEndpoints = new promClient.Gauge({
+      name: 'keeper_rpc_failover_healthy_endpoints',
+      help: 'Number of healthy RPC endpoints currently available',
+      registers: [this.register],
+    });
+    this.promFailoverTotalEndpoints = new promClient.Gauge({
+      name: 'keeper_rpc_failover_total_endpoints',
+      help: 'Total configured RPC endpoints for failover',
+      registers: [this.register],
+    });
 
     this.promBudgetConsumed = new promClient.Counter({
       name: 'keeper_retry_budget_consumed_total',
@@ -376,6 +431,8 @@ class MetricsServer {
     this.promWebhookAccepted.inc(0);
     this.promWebhookRejected.inc({ reason: 'none' }, 0);
     this.promWebhookReplayRejected.inc(0);
+    this.promFailoverEvents.inc(0);
+    this.promFailoverSwitches.inc(0);
 
     this.promAvgFee.set(this.metrics.gauges.avgFeePaidXlm);
     this.promCycleDuration.set(this.metrics.gauges.lastCycleDurationMs);
@@ -407,6 +464,17 @@ class MetricsServer {
     this.promDriftTask.set(this.metrics.driftState.taskId || 0);
     this.promDriftWarningCount.set(this.metrics.driftState.warning || 0);
     this.promDriftCriticalCount.set(this.metrics.driftState.critical || 0);
+
+    if (typeof this.failoverStateProvider === 'function') {
+      try {
+        this.metrics.updateFailoverState(this.failoverStateProvider());
+      } catch (error) {
+        this.logger.error('Error reading failover state', { error: error.message });
+      }
+    }
+    this.promFailoverActiveIndex.set(this.metrics.failoverState.activeIndex || 0);
+    this.promFailoverHealthyEndpoints.set(this.metrics.failoverState.healthyEndpoints || 0);
+    this.promFailoverTotalEndpoints.set(this.metrics.failoverState.totalEndpoints || 0);
 
     if (this.retryBudgetTracker) {
       const budgetStats = this.retryBudgetTracker.getStats();
@@ -518,6 +586,7 @@ class MetricsServer {
     const healthData = {
       ...status,
       p2p: this.getP2PState(),
+      failover: this.getFailoverState(),
       ...(this.retryBudgetTracker && {
         retryBudget: this.retryBudgetTracker.getStats(),
       }),
@@ -545,6 +614,7 @@ class MetricsServer {
         totalHistoricalSamples: forecasterState.totalHistoricalSamples,
       },
       p2p: this.getP2PState(),
+      failover: this.getFailoverState(),
       ...(this.retryBudgetTracker && {
         retryBudget: this.retryBudgetTracker.getStats(),
       }),
@@ -564,6 +634,18 @@ class MetricsServer {
       this.logger.error('Error reading P2P state', { error: error.message });
       return { enabled: true, status: 'error' };
     }
+  }
+
+  getFailoverState() {
+    if (typeof this.failoverStateProvider === 'function') {
+      try {
+        const next = this.failoverStateProvider();
+        this.metrics.updateFailoverState(next);
+      } catch (error) {
+        this.logger.error('Error reading failover state', { error: error.message });
+      }
+    }
+    return this.metrics.failoverState;
   }
 
   handleForecast(res) {
@@ -688,6 +770,10 @@ class MetricsServer {
       );
     } else if (key === 'adminStateChangesTotal') {
       this.promAdminStateChanges.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'failoverEventsTotal') {
+      this.promFailoverEvents.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'failoverSwitchesTotal') {
+      this.promFailoverSwitches.inc(typeof amount === 'number' ? amount : 1);
     }
   }
 
@@ -714,6 +800,10 @@ class MetricsServer {
 
   updateAdminState(state) {
     this.metrics.updateAdminState(state);
+  }
+
+  updateFailoverState(state) {
+    this.metrics.updateFailoverState(state);
   }
 
   stop() {

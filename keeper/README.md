@@ -120,6 +120,9 @@ DRIFT_CRITICAL_SECONDS=300
 - **`P2P_ENABLED` / `P2P_SHARED_SECRET`**: Enables signed peer discovery and load-aware ownership. See [P2P Keeper Discovery](./docs/p2p-keeper-discovery.md).
 - **`P2P_PUBLIC_URL` / `P2P_BOOTSTRAP_PEERS`**: Advertised peer URL and initial peer list used to join the keeper mesh.
 - **`DRIFT_WARNING_SECONDS` / `DRIFT_CRITICAL_SECONDS`**: Thresholds for recurring execution drift classification.
+- **`SOROBAN_RPC_URLS` / `RPC_FAILOVER_ENABLED`**: Optional multi-region RPC list and failover toggle (automatically enabled when multiple URLs are configured).
+- **`RPC_FAILOVER_FAILURE_THRESHOLD` / `RPC_FAILOVER_COOLDOWN_MS`**: Endpoint quarantine policy after repeated failures.
+- **`RPC_FAILOVER_HEALTH_CHECK_INTERVAL_MS`**: Background health-probe interval used for endpoint recovery and rebalancing.
 
 ## RPC Load Balancer Configuration
 
@@ -159,6 +162,12 @@ RPC_LOAD_BALANCING_STRATEGY=weighted_round_robin
 The optional P2P layer lets keepers discover each other, advertise load, and split ownership with load-aware rendezvous hashing. It is disabled by default; when disabled or unhealthy, the keeper falls back to configured shard ownership.
 
 See [P2P Keeper Discovery](./docs/p2p-keeper-discovery.md) for setup, security review notes, health fields, and failure behavior.
+
+## Disaster Recovery and Failover
+
+The keeper supports automated multi-region RPC failover for disaster recovery. Configure a primary endpoint in `SOROBAN_RPC_URL` and additional regions in `SOROBAN_RPC_URLS`.
+
+See [Disaster Recovery and Failover Guide](./docs/disaster-recovery-failover.md) for architecture, metrics, and operational runbooks.
 
 ### Dead-Letter Queue Configuration
 
