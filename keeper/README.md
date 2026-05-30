@@ -95,6 +95,14 @@ HEALTH_STALE_THRESHOLD_MS=60000
 # FRAUD_ALERT_WEBHOOK_TIMEOUT_MS=5000
 # FRAUD_ALERT_MAX_ATTEMPTS=3
 
+# Reconciliation / accounting alerting
+# RECONCILIATION_ALERT_WEBHOOK_URL=https://alerts.example.com/keeper-reconciliation
+# RECONCILIATION_ALERT_DEBOUNCE_MS=600000
+# RECONCILIATION_EXECUTION_SETTLING_MS=120000
+# RECONCILIATION_TOLERANCE=0
+# RECONCILIATION_ALERT_WEBHOOK_TIMEOUT_MS=5000
+# RECONCILIATION_ALERT_MAX_ATTEMPTS=3
+
 # Stable work partitioning across keeper instances
 KEEPER_SHARD_INDEX=0
 KEEPER_SHARD_COUNT=1
@@ -146,6 +154,12 @@ DRIFT_CRITICAL_SECONDS=300
 - **`FRAUD_CROSS_TASK_FEE_THRESHOLD`**: Total fee volume required for cross-task velocity alerts.
 - **`FRAUD_ALERT_WEBHOOK_TIMEOUT_MS`**: Timeout for outbound fraud alert webhook delivery.
 - **`FRAUD_ALERT_MAX_ATTEMPTS`**: Number of delivery attempts before an alert is marked failed.
+- **`RECONCILIATION_ALERT_WEBHOOK_URL`**: Optional webhook target for balance-vs-fee reconciliation mismatches.
+- **`RECONCILIATION_ALERT_DEBOUNCE_MS`**: Minimum time between duplicate reconciliation alerts for the same signature.
+- **`RECONCILIATION_EXECUTION_SETTLING_MS`**: Grace period before an unmatched execution is escalated.
+- **`RECONCILIATION_TOLERANCE`**: Accepted balance drift tolerance; keep at `0` for exact accounting.
+- **`RECONCILIATION_ALERT_WEBHOOK_TIMEOUT_MS`**: Timeout for outbound reconciliation alert webhook delivery.
+- **`RECONCILIATION_ALERT_MAX_ATTEMPTS`**: Number of delivery attempts before a reconciliation alert is marked failed.
 - **`KEEPER_SHARD_INDEX` / `KEEPER_SHARD_COUNT`**: Stable shard assignment controls so multiple keeper instances can partition work without ambiguous ownership.
 - **`KEEPER_SHARD_LABEL`**: Optional human-readable shard identifier used in metrics and logs.
 - **`P2P_ENABLED` / `P2P_SHARED_SECRET`**: Enables signed peer discovery and load-aware ownership. See [P2P Keeper Discovery](./docs/p2p-keeper-discovery.md).
@@ -153,6 +167,8 @@ DRIFT_CRITICAL_SECONDS=300
 - **`DRIFT_WARNING_SECONDS` / `DRIFT_CRITICAL_SECONDS`**: Thresholds for recurring execution drift classification.
 
 Fraud alerts are intentionally conservative: they rely on multiple heuristic signals, are debounced per signature, and fall back to local logging plus metrics if the outbound webhook is unavailable.
+
+Reconciliation is strict by default. A KeeperPaid event must match a successful execution fee exactly, and any pending execution that does not reconcile within the settling window is escalated as a mismatch.
 
 ## P2P Keeper Discovery
 
@@ -181,6 +197,7 @@ DLQ_MAX_RECORDS=1000
 The DLQ automatically isolates tasks that fail repeatedly, preventing resource waste and providing diagnostic information for operators. See [Dead-Letter Queue Documentation](./docs/dead-letter-queue.md) for details.
 
 For fraud and anomaly alerting, see [Fraud Detection and Anomaly Alerting](./docs/fraud-detection.md).
+For strict fee-vs-balance accounting, see [Real-time Financial Reconciliation](./docs/reconciliation.md).
 
 ## Setup Instructions
 

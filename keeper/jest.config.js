@@ -11,6 +11,7 @@ module.exports = {
     "src/concurrency.js",
     "src/fraudDetection.js",
     "src/logger.js",
+    "src/reconciliation.js",
     "src/poller.js",
     "src/queue.js",
     "src/registry.js",

@@ -18,6 +18,8 @@ GET  /metrics
 GET  /metrics/forecast
 GET  /drift
 GET  /admin/keeper
+GET  /admin/fraud
+GET  /admin/reconciliation
 POST /admin/keeper/pause
 POST /admin/keeper/resume
 ```
@@ -72,6 +74,34 @@ The `/admin/keeper*` endpoints require `Authorization: Bearer <KEEPER_ADMIN_TOKE
 | `keeper_recurring_drift_task_id` | Gauge | Task id associated with the highest current drift |
 | `keeper_recurring_drift_warning_tasks` | Gauge | Number of tasks currently showing warning-level drift |
 | `keeper_recurring_drift_critical_tasks` | Gauge | Number of tasks currently showing critical drift |
+
+### Fraud Detection Metrics
+
+| Metric Name | Type | Description |
+|-------------|------|-------------|
+| `keeper_fraud_observations_total` | Counter | Total number of task execution observations processed by fraud detection |
+| `keeper_fraud_alerts_queued_total` | Counter | Total number of fraud alerts queued for delivery |
+| `keeper_fraud_alerts_sent_total` | Counter | Total number of fraud alerts delivered or emitted locally |
+| `keeper_fraud_alerts_suppressed_total` | Counter | Total number of fraud alerts suppressed by debounce rules |
+| `keeper_fraud_alerts_failed_total` | Counter | Total number of fraud alerts that failed after retries |
+| `keeper_fraud_pipeline_errors_total` | Counter | Total number of fraud detection pipeline errors encountered |
+| `keeper_fraud_risk_score` | Gauge | Current fraud risk score produced by the heuristic engine |
+| `keeper_fraud_pending_alerts` | Gauge | Number of fraud alerts currently queued for delivery |
+
+### Reconciliation Metrics
+
+| Metric Name | Type | Description |
+|-------------|------|-------------|
+| `keeper_reconciliation_executions_total` | Counter | Total number of successful task executions observed by reconciliation |
+| `keeper_reconciliation_accounting_changes_total` | Counter | Total number of accounting changes observed by reconciliation |
+| `keeper_reconciliation_matches_total` | Counter | Total number of execution-to-accounting matches confirmed |
+| `keeper_reconciliation_mismatches_total` | Counter | Total number of reconciliation mismatches detected |
+| `keeper_reconciliation_alerts_queued_total` | Counter | Total number of reconciliation alerts queued for delivery |
+| `keeper_reconciliation_alerts_sent_total` | Counter | Total number of reconciliation alerts delivered or emitted locally |
+| `keeper_reconciliation_alerts_failed_total` | Counter | Total number of reconciliation alerts that failed after retries |
+| `keeper_reconciliation_pipeline_errors_total` | Counter | Total number of reconciliation pipeline errors encountered |
+| `keeper_reconciliation_balance_drift` | Gauge | Current balance drift between expected and observed balances |
+| `keeper_reconciliation_pending_executions` | Gauge | Number of successful executions awaiting reconciliation confirmation |
 
 ### Default Process Metrics
 

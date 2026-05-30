@@ -13,6 +13,7 @@ const { executeTaskWithRetry } = require("./src/executor");
 const { ExecutionIdempotencyGuard } = require("./src/idempotency");
 const { MetricsServer } = require("./src/metrics");
 const { FraudDetectionService } = require("./src/fraudDetection");
+const { ReconciliationEngine } = require("./src/reconciliation");
 const HistoryManager = require("./src/history");
 const { normalizeShardConfig, filterTasksForShard } = require("./src/sharding");
 const { StartupValidator } = require("./src/validator");
@@ -61,6 +62,7 @@ async function main() {
   const historyManager = new HistoryManager({
     logger: createLogger("history"),
   });
+  let reconciliationEngine = null;
   const shardConfig = normalizeShardConfig({
     shardIndex: config.shardIndex,
     shardCount: config.shardCount,
@@ -204,6 +206,17 @@ async function main() {
           shardLabel: shardConfig.shardLabel,
         },
       });
+      if (reconciliationEngine) {
+        reconciliationEngine.observeExecution({
+          taskId,
+          status: finalResult.status || "SUCCESS",
+          feePaid: finalResult.feePaid || 0,
+          txHash: finalResult.txHash || null,
+          correlationId,
+          attemptId: context?.attemptId || null,
+          observedAt: new Date().toISOString(),
+        });
+      }
     }
     shutdownManager.completeTask(taskId);
   });
@@ -349,6 +362,22 @@ async function main() {
     logger: createLogger("registry"),
   });
   await registry.init();
+
+  reconciliationEngine = new ReconciliationEngine({
+    logger: createLogger("reconciliation"),
+    metricsServer,
+    historyManager,
+    alertWebhookUrl: config.reconciliationAlertWebhookUrl,
+    alertDebounceMs: config.reconciliationAlertDebounceMs,
+    webhookTimeoutMs: config.reconciliationAlertWebhookTimeoutMs,
+    maxAlertAttempts: config.reconciliationAlertMaxAttempts,
+    executionSettlingMs: config.reconciliationExecutionSettlingMs,
+    tolerance: config.reconciliationTolerance,
+  });
+  reconciliationEngine.attachRegistry(registry);
+  reconciliationEngine.seedFromTasks(registry.getTasksWithStats());
+  metricsServer.setReconciliationEngine(reconciliationEngine);
+  reconciliationEngine.reconcileSnapshot(registry.getTasksWithStats());
 
   const p2pNetwork = new KeeperP2PNetwork({
     ...config.p2p,
@@ -506,6 +535,9 @@ async function main() {
 
       // Poll for new TaskRegistered events
       await registry.poll();
+      if (reconciliationEngine) {
+        reconciliationEngine.reconcileSnapshot(registry.getTasksWithStats());
+      }
 
       // Get list of all registered task IDs
       const taskIds = registry.getTaskIds();
@@ -552,8 +584,6 @@ async function main() {
           shutdownManager.trackTask(taskId)
         );
 
-        await queue.enqueue(dueTaskIds, executeTask);
-        
         // Transform the dueTask results to pass correlation IDs to the queue
         const tasksToEnqueue = dueTaskIds.map(d => ({
           taskId: d.taskId,

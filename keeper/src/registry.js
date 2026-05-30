@@ -1,5 +1,6 @@
 const fs = require('fs');
 const path = require('path');
+const EventEmitter = require('events');
 const { xdr } = require('@stellar/stellar-sdk');
 const { createLogger } = require('./logger');
 
@@ -19,8 +20,9 @@ const EVENT_TOPICS = {
   DependencyRemoved: 'AAAADwAAABFEZXBlbmRlbmN5UmVtb3ZlZAAAAA==',
 };
 
-class TaskRegistry {
+class TaskRegistry extends EventEmitter {
   constructor(server, contractId, options = {}) {
+    super();
     this.server = server;
     this.contractId = contractId;
     this.taskIds = new Set();
@@ -102,13 +104,47 @@ class TaskRegistry {
    * @param {number} taskId 
    * @param {Object} update 
    */
-  updateTask(taskId, update) {
+  updateTask(taskId, update, meta = {}) {
     const existing = this.tasks.get(taskId) || { id: taskId, status: 'unknown' };
-    this.tasks.set(taskId, { ...existing, ...update, updatedAt: new Date().toISOString() });
+    const next = { ...existing, ...update, updatedAt: new Date().toISOString() };
+    this.tasks.set(taskId, next);
     
     // Also ensure it's in taskIds
     if (!this.taskIds.has(taskId)) {
       this.taskIds.add(taskId);
+    }
+
+    this.emit('task:updated', {
+      taskId,
+      previous: existing,
+      next,
+      update: { ...update },
+      meta: { ...meta },
+    });
+
+    if (meta && meta.source) {
+      const previousBalance = Number.isFinite(meta.previousBalance)
+        ? Number(meta.previousBalance)
+        : Number(existing.gas_balance ?? 0);
+      const nextBalance = Number(next.gas_balance);
+      const hasBalanceChange =
+        Number.isFinite(nextBalance) &&
+        previousBalance !== nextBalance;
+
+      if (hasBalanceChange && ['KeeperPaid', 'GasDeposited', 'GasWithdrawn'].includes(meta.source)) {
+        this.emit('accounting:change', {
+          taskId,
+          source: meta.source,
+          amount: Number(meta.amount),
+          delta: Number.isFinite(meta.delta) ? Number(meta.delta) : (nextBalance - previousBalance),
+          previousBalance,
+          nextBalance,
+          ledger: meta.ledger ?? null,
+          ledgerCloseAt: meta.ledgerCloseAt || null,
+          txHash: meta.txHash || null,
+          timestamp: meta.timestamp || new Date().toISOString(),
+        });
+      }
     }
   }
 
@@ -236,19 +272,40 @@ class TaskRegistry {
           last_run: ledgerTimestamp,
           gas_balance: (task.gas_balance || 0) - fee,
           status: 'active'
+        }, {
+          source: 'KeeperPaid',
+          amount: fee,
+          delta: -fee,
+          previousBalance: task.gas_balance || 0,
+          ledger: event.ledger,
+          ledgerCloseAt: event.ledgerCloseAt,
         });
         break;
 
       case 'GasDeposited':
         // eventData is [from, amount]
         const depositAmount = eventData ? Number(eventData[1]) : 0;
-        this.updateTask(taskId, { gas_balance: (task.gas_balance || 0) + depositAmount });
+        this.updateTask(taskId, { gas_balance: (task.gas_balance || 0) + depositAmount }, {
+          source: 'GasDeposited',
+          amount: depositAmount,
+          delta: depositAmount,
+          previousBalance: task.gas_balance || 0,
+          ledger: event.ledger,
+          ledgerCloseAt: event.ledgerCloseAt,
+        });
         break;
 
       case 'GasWithdrawn':
         // eventData is [from, amount]
         const withdrawAmount = eventData ? Number(eventData[1]) : 0;
-        this.updateTask(taskId, { gas_balance: (task.gas_balance || 0) - withdrawAmount });
+        this.updateTask(taskId, { gas_balance: (task.gas_balance || 0) - withdrawAmount }, {
+          source: 'GasWithdrawn',
+          amount: withdrawAmount,
+          delta: -withdrawAmount,
+          previousBalance: task.gas_balance || 0,
+          ledger: event.ledger,
+          ledgerCloseAt: event.ledgerCloseAt,
+        });
         break;
 
       case 'TaskCancelled':
@@ -351,4 +408,3 @@ class TaskRegistry {
 }
 
 module.exports = TaskRegistry;
-

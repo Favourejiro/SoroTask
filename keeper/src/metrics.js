@@ -40,6 +40,22 @@ class Metrics {
       pendingAlerts: 0,
       recentObservations: 0,
     };
+    this.reconciliationState = {
+      reconciliations: 0,
+      executionsObserved: 0,
+      accountingChangesObserved: 0,
+      matches: 0,
+      mismatches: 0,
+      pendingExecutions: 0,
+      alertsQueued: 0,
+      alertsSent: 0,
+      alertsFailed: 0,
+      pipelineErrors: 0,
+      lastDrift: 0,
+      lastMismatchAt: null,
+      lastMismatchReason: null,
+      lastObservedAt: null,
+    };
     this.reset();
   }
 
@@ -63,6 +79,14 @@ class Metrics {
       fraudAlertsSuppressedTotal: 0,
       fraudAlertsFailedTotal: 0,
       fraudPipelineErrorsTotal: 0,
+      reconciliationExecutionsObservedTotal: 0,
+      reconciliationAccountingChangesObservedTotal: 0,
+      reconciliationMatchesTotal: 0,
+      reconciliationMismatchesTotal: 0,
+      reconciliationAlertsQueuedTotal: 0,
+      reconciliationAlertsSentTotal: 0,
+      reconciliationAlertsFailedTotal: 0,
+      reconciliationPipelineErrorsTotal: 0,
     };
     this.gauges = {
       avgFeePaidXlm: 0,
@@ -70,6 +94,8 @@ class Metrics {
       lastRetryCycleDurationMs: 0,
       rpcCircuitState: 0,
       fraudRiskScore: 0,
+      reconciliationBalanceDrift: 0,
+      reconciliationPendingExecutions: 0,
     };
     this.feeSamples = [];
     this.fraudState = {
@@ -84,6 +110,22 @@ class Metrics {
       lastAlertReason: null,
       pendingAlerts: 0,
       recentObservations: 0,
+    };
+    this.reconciliationState = {
+      reconciliations: 0,
+      executionsObserved: 0,
+      accountingChangesObserved: 0,
+      matches: 0,
+      mismatches: 0,
+      pendingExecutions: 0,
+      alertsQueued: 0,
+      alertsSent: 0,
+      alertsFailed: 0,
+      pipelineErrors: 0,
+      lastDrift: 0,
+      lastMismatchAt: null,
+      lastMismatchReason: null,
+      lastObservedAt: null,
     };
   }
 
@@ -144,6 +186,10 @@ class Metrics {
     this.fraudState = { ...this.fraudState, ...state };
   }
 
+  updateReconciliationState(state = {}) {
+    this.reconciliationState = { ...this.reconciliationState, ...state };
+  }
+
   snapshot() {
     return {
       ...this.counters,
@@ -152,6 +198,7 @@ class Metrics {
       shard: { ...this.shardState },
       drift: { ...this.driftState },
       fraud: { ...this.fraudState },
+      reconciliation: { ...this.reconciliationState },
     };
   }
 
@@ -229,6 +276,10 @@ class MetricsServer {
   setWebhookHandler(handler, path = this.webhookPath) {
     this.webhookHandler = handler;
     this.webhookPath = path;
+  }
+
+  setReconciliationEngine(engine) {
+    this.reconciliationEngine = engine;
   }
 
   setFraudDetector(detector) {
@@ -397,6 +448,56 @@ class MetricsServer {
       help: 'Number of fraud alerts currently queued for delivery',
       registers: [this.register],
     });
+    this.promReconciliationExecutions = new promClient.Counter({
+      name: 'keeper_reconciliation_executions_total',
+      help: 'Total number of successful task executions observed by reconciliation',
+      registers: [this.register],
+    });
+    this.promReconciliationAccountingChanges = new promClient.Counter({
+      name: 'keeper_reconciliation_accounting_changes_total',
+      help: 'Total number of accounting changes observed by reconciliation',
+      registers: [this.register],
+    });
+    this.promReconciliationMatches = new promClient.Counter({
+      name: 'keeper_reconciliation_matches_total',
+      help: 'Total number of execution-to-accounting matches confirmed',
+      registers: [this.register],
+    });
+    this.promReconciliationMismatches = new promClient.Counter({
+      name: 'keeper_reconciliation_mismatches_total',
+      help: 'Total number of reconciliation mismatches detected',
+      registers: [this.register],
+    });
+    this.promReconciliationAlertsQueued = new promClient.Counter({
+      name: 'keeper_reconciliation_alerts_queued_total',
+      help: 'Total number of reconciliation alerts queued for delivery',
+      registers: [this.register],
+    });
+    this.promReconciliationAlertsSent = new promClient.Counter({
+      name: 'keeper_reconciliation_alerts_sent_total',
+      help: 'Total number of reconciliation alerts delivered or emitted locally',
+      registers: [this.register],
+    });
+    this.promReconciliationAlertsFailed = new promClient.Counter({
+      name: 'keeper_reconciliation_alerts_failed_total',
+      help: 'Total number of reconciliation alerts that failed after retries',
+      registers: [this.register],
+    });
+    this.promReconciliationPipelineErrors = new promClient.Counter({
+      name: 'keeper_reconciliation_pipeline_errors_total',
+      help: 'Total number of reconciliation pipeline errors encountered',
+      registers: [this.register],
+    });
+    this.promReconciliationDrift = new promClient.Gauge({
+      name: 'keeper_reconciliation_balance_drift',
+      help: 'Current reconciliation drift between expected and observed balances',
+      registers: [this.register],
+    });
+    this.promReconciliationPending = new promClient.Gauge({
+      name: 'keeper_reconciliation_pending_executions',
+      help: 'Number of successful executions awaiting reconciliation confirmation',
+      registers: [this.register],
+    });
 
     this.promBudgetConsumed = new promClient.Counter({
       name: 'keeper_retry_budget_consumed_total',
@@ -498,6 +599,16 @@ class MetricsServer {
     this.promFraudPipelineErrors.inc(0);
     this.promFraudRiskScore.set(this.metrics.fraudState.lastRiskScore || 0);
     this.promFraudPendingAlerts.set(this.metrics.fraudState.pendingAlerts || 0);
+    this.promReconciliationExecutions.inc(0);
+    this.promReconciliationAccountingChanges.inc(0);
+    this.promReconciliationMatches.inc(0);
+    this.promReconciliationMismatches.inc(0);
+    this.promReconciliationAlertsQueued.inc(0);
+    this.promReconciliationAlertsSent.inc(0);
+    this.promReconciliationAlertsFailed.inc(0);
+    this.promReconciliationPipelineErrors.inc(0);
+    this.promReconciliationDrift.set(this.metrics.reconciliationState.lastDrift || 0);
+    this.promReconciliationPending.set(this.metrics.reconciliationState.pendingExecutions || 0);
 
     if (this.retryBudgetTracker) {
       const budgetStats = this.retryBudgetTracker.getStats();
@@ -576,6 +687,9 @@ class MetricsServer {
       } else if (req.url === '/admin/fraud' || req.url === '/admin/fraud/') {
         protect(() => this.handleFraudState(res))();
 
+      } else if (req.url === '/admin/reconciliation' || req.url === '/admin/reconciliation/') {
+        protect(() => this.handleReconciliationState(res))();
+
       } else if (url.pathname === this.webhookPath && this.webhookHandler) {
         // Webhook requests (unauthenticated - auth handled by webhook handler)
         this.webhookHandler.handle(req, res);
@@ -598,6 +712,8 @@ class MetricsServer {
         await this.handlePauseResume(req, res, false);
       } else if (url.pathname === '/admin/fraud' || url.pathname === '/admin/fraud/') {
         this.handleFraudState(res);
+      } else if (url.pathname === '/admin/reconciliation' || url.pathname === '/admin/reconciliation/') {
+        this.handleReconciliationState(res);
       } else {
         res.writeHead(404);
         res.end('Not Found');
@@ -694,6 +810,24 @@ class MetricsServer {
       this.logger.error('Error reading fraud detection state', { error: error.message });
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'Failed to read fraud state' }));
+    }
+  }
+
+  handleReconciliationState(res) {
+    if (!this.reconciliationEngine) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Reconciliation unavailable' }));
+      return;
+    }
+
+    try {
+      const payload = this.reconciliationEngine.getState();
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(payload, null, 2));
+    } catch (error) {
+      this.logger.error('Error reading reconciliation state', { error: error.message });
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Failed to read reconciliation state' }));
     }
   }
 
@@ -814,6 +948,22 @@ class MetricsServer {
       this.promFraudAlertsFailed.inc(typeof amount === 'number' ? amount : 1);
     } else if (key === 'fraudPipelineErrorsTotal') {
       this.promFraudPipelineErrors.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationExecutionsObservedTotal') {
+      this.promReconciliationExecutions.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationAccountingChangesObservedTotal') {
+      this.promReconciliationAccountingChanges.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationMatchesTotal') {
+      this.promReconciliationMatches.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationMismatchesTotal') {
+      this.promReconciliationMismatches.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationAlertsQueuedTotal') {
+      this.promReconciliationAlertsQueued.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationAlertsSentTotal') {
+      this.promReconciliationAlertsSent.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationAlertsFailedTotal') {
+      this.promReconciliationAlertsFailed.inc(typeof amount === 'number' ? amount : 1);
+    } else if (key === 'reconciliationPipelineErrorsTotal') {
+      this.promReconciliationPipelineErrors.inc(typeof amount === 'number' ? amount : 1);
     }
   }
 
@@ -844,6 +994,12 @@ class MetricsServer {
     this.metrics.updateFraudState(state);
     this.promFraudRiskScore.set(this.metrics.fraudState.lastRiskScore || 0);
     this.promFraudPendingAlerts.set(this.metrics.fraudState.pendingAlerts || 0);
+  }
+
+  updateReconciliationState(state) {
+    this.metrics.updateReconciliationState(state);
+    this.promReconciliationDrift.set(this.metrics.reconciliationState.lastDrift || 0);
+    this.promReconciliationPending.set(this.metrics.reconciliationState.pendingExecutions || 0);
   }
 
   updateAdminState(state) {
