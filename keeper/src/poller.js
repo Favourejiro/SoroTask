@@ -316,7 +316,7 @@ class TaskPoller {
           this.stats.tasksChecked++;
         } else if (result.status === 'rejected') {
           this.stats.errors++;
-          this.logger.error('Error checking task', { taskId: taskIds[index], error: result.reason?.message || result.reason });
+          this.logger.error('Error checking task', { taskId: candidateIds[index], error: result.reason?.message || result.reason });
         }
       });
 
