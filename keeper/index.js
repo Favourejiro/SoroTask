@@ -12,16 +12,20 @@ const { dryRunTask } = require("./src/dryRun");
 const { executeTaskWithRetry } = require("./src/executor");
 const { ExecutionIdempotencyGuard } = require("./src/idempotency");
 const { MetricsServer } = require("./src/metrics");
+const { GasMonitor } = require("./src/gasMonitor");
 const HistoryManager = require("./src/history");
 const { StreamHub } = require("./src/streamHub");
 const { ApiGateway } = require("./src/apiGateway");
 const { FailurePredictor, KeeperReputationScorer } = require("./src/insights");
 const { normalizeShardConfig, filterTasksForShard } = require("./src/sharding");
+const { PostgresShardManager } = require("./src/postgresShardManager");
 const { StartupValidator } = require("./src/validator");
 const { GracefulShutdownManager } = require("./src/gracefulShutdown");
 const { createDefaultFilterChain } = require("./src/taskFilter");
 const { WebhookAuthProtocol, InMemoryReplayStore } = require("./src/webhookAuth");
 const { WebhookTriggerHandler } = require("./src/webhookTrigger");
+const { KeeperP2PNetwork } = require("./src/p2pNetwork");
+const { ResolverRuntime } = require("./src/resolverRuntime");
 
 // Create root logger for the main module
 const logger = createLogger("keeper");
@@ -96,7 +100,9 @@ async function main() {
     changedAt: null,
     actor: null,
   };
-  const metricsServer = new MetricsServer(undefined, createLogger("metrics"), null, {
+
+  const gasMonitor = new GasMonitor(createLogger("gasMonitor"));
+  const metricsServer = new MetricsServer(gasMonitor, createLogger("metrics"), null, {
     port: config.metricsPort,
     healthStaleThreshold: config.healthStaleThresholdMs,
     historyManager,
@@ -133,6 +139,20 @@ async function main() {
 
   metricsServer.start();
 
+  const dbShardManager = new PostgresShardManager({
+    baseCount: config.dbShardBaseCount,
+    maxCount: config.dbShardMaxCount,
+    scaleUpThreshold: config.dbShardScaleUpThreshold,
+    scaleDownThreshold: config.dbShardScaleDownThreshold,
+    userCapacityPerShard: config.dbShardUserCapacity,
+    taskCapacityPerShard: config.dbShardTaskCapacity,
+    enableAutoScaling: config.dbShardAutoScaling,
+  }, createLogger("db-shard"));
+  metricsServer.updateDbShardState(dbShardManager.refresh({
+    activeUsers: 0,
+    pendingTasks: 0,
+  }));
+
   // Perform startup validation to fail fast on configuration errors
   const validator = new StartupValidator(
     server,
@@ -152,6 +172,26 @@ async function main() {
     logger: createLogger("idempotency"),
   });
 
+  let resolverRuntime = null;
+  if (config.resolverFunctionsConfig) {
+    try {
+      resolverRuntime = ResolverRuntime.fromConfigFile(config.resolverFunctionsConfig, {
+        logger: createLogger("resolver-runtime"),
+        defaultTimeoutMs: config.resolverDefaultTimeoutMs,
+      });
+      logger.info("Resolver runtime initialized", {
+        resolverCount: resolverRuntime.list().length,
+        configPath: config.resolverFunctionsConfig,
+      });
+    } catch (error) {
+      logger.fatal("Failed to initialize resolver runtime", {
+        configPath: config.resolverFunctionsConfig,
+        error: error.message,
+      });
+      process.exit(1);
+    }
+  }
+
   // Build the pre-filter chain — eliminates non-actionable tasks before RPC calls.
   // Filters run in order: null-guard → cached gas → cached timing → idempotency lock → circuit breaker.
   const filterChain = createDefaultFilterChain({
@@ -168,6 +208,8 @@ async function main() {
     simulationCacheMaxSize: process.env.SIMULATION_CACHE_MAX_SIZE,
     metricsServer,
     historyManager,
+    resolverRuntime,
+    resolverFailureMode: config.resolverFailureMode,
     shardLabel: shardConfig.shardLabel,
     driftWarningSeconds: config.driftWarningSeconds,
     driftCriticalSeconds: config.driftCriticalSeconds,
@@ -223,7 +265,7 @@ async function main() {
   // Task executor function - calls contract.execute(keeper, task_id)
   // In dry-run mode, simulates the transaction without submitting it.
   const executeTask = async (taskId, context = {}) => {
-    const correlationId = context.correlationId || context.attemptId;
+    const correlationId = context.correlationId || context.pollCorrelationId || context.attemptId;
     const taskLogger = correlationId ? logger.childWithTrace(correlationId) : logger;
     
     const account = await server.getAccount(keypair.publicKey());
@@ -262,6 +304,12 @@ async function main() {
     }
 
     try {
+      const dynamicFeeMultiplier = gasMonitor && typeof gasMonitor.getDynamicFeeMultiplier === 'function'
+        ? gasMonitor.getDynamicFeeMultiplier()
+        : 1;
+      deps.dynamicFeeMultiplier = dynamicFeeMultiplier;
+      deps.gasMonitor = gasMonitor;
+
       const retryResult = await executeTaskWithRetry(taskId, deps, {
         attemptId: context.attemptId,
         correlationId,
@@ -528,6 +576,11 @@ async function main() {
 
       // Get list of all registered task IDs
       const taskIds = registry.getTaskIds();
+      const dbShardState = dbShardManager.refresh({
+        activeUsers: queue.getInFlightStatus().inFlight,
+        pendingTasks: taskIds.length,
+      });
+      metricsServer.updateDbShardState(dbShardState);
       const shardSelection = selectTaskOwnership(taskIds);
       metricsServer.updateShardState({
         shardIndex: shardSelection.shardIndex,
@@ -554,6 +607,7 @@ async function main() {
       const dueTaskIds = await poller.pollDueTasks(shardSelection.ownedTaskIds, {
         registry,
         idempotencyGuard,
+        includeContext: true,
       });
 
       if (dueTaskIds.length > 0) {
@@ -566,20 +620,11 @@ async function main() {
           activeLocks: lockSnapshot.lockCount,
         });
 
-        // Track tasks before enqueueing
-        dueTaskIds.forEach((taskId) =>
-          shutdownManager.trackTask(taskId)
+        dueTaskIds.forEach((task) =>
+          shutdownManager.trackTask(typeof task === "object" ? task.taskId : task)
         );
 
         await queue.enqueue(dueTaskIds, executeTask);
-        
-        // Transform the dueTask results to pass correlation IDs to the queue
-        const tasksToEnqueue = dueTaskIds.map(d => ({
-          taskId: d.taskId,
-          context: { pollCorrelationId: d.correlationId }
-        }));
-        
-        await queue.enqueue(tasksToEnqueue, executeTask);
       } else {
         logger.info("No tasks due for execution");
       }
@@ -661,13 +706,13 @@ async function main() {
       const shardSelection = selectTaskOwnership(taskIds);
       const dueTaskIds = controlState.paused
         ? []
-        : await poller.pollDueTasks(shardSelection.ownedTaskIds, { registry, idempotencyGuard });
+        : await poller.pollDueTasks(shardSelection.ownedTaskIds, {
+          registry,
+          idempotencyGuard,
+          includeContext: true,
+        });
       if (dueTaskIds.length > 0) {
-        const tasksToEnqueue = dueTaskIds.map(d => ({
-          taskId: d.taskId,
-          context: { pollCorrelationId: d.correlationId }
-        }));
-        await queue.enqueue(tasksToEnqueue, executeTask);
+        await queue.enqueue(dueTaskIds, executeTask);
       }
     } catch (error) {
       logger.error("Error in initial poll", { error: error.message });

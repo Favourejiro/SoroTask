@@ -6,12 +6,40 @@ const { URL } = require('url');
 const { createLogger } = require('./logger');
 const { ApiGateway } = require('./apiGateway');
 const { FailurePredictor, KeeperReputationScorer } = require('./insights');
+const SloMetrics = require('./sloMetrics');
+
+class MetricsHistory {
+  constructor(maxSamples = 120) {
+    this.maxSamples = maxSamples;
+    this.samples = [];
+  }
+
+  record(point) {
+    this.samples.push({
+      timestamp: new Date().toISOString(),
+      ...point,
+    });
+    if (this.samples.length > this.maxSamples) {
+      this.samples.shift();
+    }
+  }
+
+  getSamples(limit) {
+    const max = typeof limit === 'number' ? limit : this.samples.length;
+    return this.samples.slice(-max);
+  }
+}
 
 class Metrics {
   constructor() {
     this.startTime = Date.now();
+    this.history = new MetricsHistory(
+      parseInt(process.env.METRICS_HISTORY_MAX_SAMPLES || '120', 10),
+    );
     this.maxFeeSamples = 100;
     this.lastPollAt = null;
+    this.lastBacklogSize = null;
+    this.retryPressure = 0;
     this.rpcConnected = false;
     this.adminState = { paused: false, reason: null, changedAt: null };
     this.shardState = {
@@ -20,6 +48,13 @@ class Metrics {
       shardLabel: 'shard-0',
       ownedTasks: 0,
       skippedTasks: 0,
+    };
+    this.dbShardState = {
+      dbShardCount: 1,
+      dbShardLabel: 'postgres-shard-0',
+      dbShardStrategy: 'fixed',
+      activeUsers: 0,
+      pendingTasks: 0,
     };
     this.driftState = {
       warning: 0,
@@ -91,6 +126,12 @@ class Metrics {
     if (typeof state.rpcConnected === 'boolean') {
       this.rpcConnected = state.rpcConnected;
     }
+    if (typeof state.backlogSize === 'number') {
+      this.lastBacklogSize = state.backlogSize;
+    }
+    if (typeof state.retryBudgetPressure === 'number') {
+      this.retryPressure = state.retryBudgetPressure;
+    }
   }
 
   updateAdminState(state = {}) {
@@ -105,6 +146,10 @@ class Metrics {
     this.shardState = { ...this.shardState, ...state };
   }
 
+  updateDbShardState(state = {}) {
+    this.dbShardState = { ...this.dbShardState, ...state };
+  }
+
   updateDriftState(state = {}) {
     this.driftState = { ...this.driftState, ...state };
   }
@@ -115,26 +160,93 @@ class Metrics {
       ...this.gauges,
       admin: { ...this.adminState },
       shard: { ...this.shardState },
+      dbShard: { ...this.dbShardState },
       drift: { ...this.driftState },
     };
+  }
+
+  recordHistoryPoint() {
+    const executed = this.counters.tasksExecutedTotal;
+    const failed = this.counters.tasksFailedTotal;
+    const attempts = executed + failed;
+    this.history.record({
+      tasksCheckedTotal: this.counters.tasksCheckedTotal,
+      tasksDueTotal: this.counters.tasksDueTotal,
+      tasksExecutedTotal: executed,
+      tasksFailedTotal: failed,
+      successRate: attempts > 0 ? executed / attempts : 1,
+      avgFeePaidXlm: this.gauges.avgFeePaidXlm,
+      lastCycleDurationMs: this.gauges.lastCycleDurationMs,
+    });
   }
 
   getHealthStatus(staleThreshold) {
     const now = Date.now();
     const uptimeSeconds = Math.floor((now - this.startTime) / 1000);
-    const isStale = this.lastPollAt && now - this.lastPollAt.getTime() > staleThreshold;
+    const lastPollAgeMs = this.lastPollAt ? now - this.lastPollAt.getTime() : null;
+    const isStale = lastPollAgeMs == null || lastPollAgeMs > staleThreshold;
+    const rpcCircuitState = this.gauges.rpcCircuitState === 2
+      ? 'OPEN'
+      : (this.gauges.rpcCircuitState === 1 ? 'HALF_OPEN' : 'CLOSED');
+    const backlogSize = typeof this.lastBacklogSize === 'number' ? this.lastBacklogSize : 0;
+    const retryBudgetPressure = this.retryPressure || 0;
+
+    const healthIssues = [];
+    if (!this.rpcConnected) {
+      healthIssues.push('RPC connectivity lost');
+    }
+    if (rpcCircuitState === 'HALF_OPEN') {
+      healthIssues.push('RPC circuit half-open');
+    }
+    if (rpcCircuitState === 'OPEN') {
+      healthIssues.push('RPC circuit open');
+    }
+    if (backlogSize > 200) {
+      healthIssues.push(`Polling backlog pressure: ${backlogSize} known task IDs`);
+    }
+    if (retryBudgetPressure >= 0.8) {
+      healthIssues.push(`Retry budget pressure at ${(retryBudgetPressure * 100).toFixed(0)}%`);
+    }
+    if (lastPollAgeMs != null && lastPollAgeMs > staleThreshold) {
+      healthIssues.push('Polling has not updated within threshold');
+    }
+    if (lastPollAgeMs == null) {
+      healthIssues.push('No successful poll has completed yet');
+    }
+
+    let status = 'healthy';
+    let statusDescription = 'Keeper is operating normally.';
+
+    if (!this.lastPollAt || rpcCircuitState === 'OPEN') {
+      status = 'unhealthy';
+      statusDescription = 'Keeper is unavailable due to stale polling or broken RPC circuits.';
+    } else if (isStale) {
+      status = 'stale';
+      statusDescription = 'Keeper polling is stale and may delay task execution. Check RPC and scheduler health.';
+    } else if (backlogSize > 500 || retryBudgetPressure >= 0.95) {
+      status = 'unhealthy';
+      statusDescription = 'Keeper is overloaded by backlog or retry pressure and may fail to keep up with task execution.';
+    } else if (!this.rpcConnected || rpcCircuitState === 'HALF_OPEN' || backlogSize > 200 || retryBudgetPressure >= 0.8) {
+      status = 'degraded';
+      statusDescription = 'Partial degradation detected. Some RPC, backlog, or retry behavior is impaired but the service is still responding.';
+    }
 
     return {
-      status: isStale ? 'stale' : 'ok',
+      status,
+      statusDescription,
+      statusSeverity: status === 'healthy' ? 'info' : status === 'degraded' ? 'warning' : 'critical',
       uptime: uptimeSeconds,
       lastPollAt: this.lastPollAt ? this.lastPollAt.toISOString() : null,
+      lastPollAgeMs,
+      staleThresholdMs: staleThreshold,
       rpcConnected: this.rpcConnected,
-      rpcCircuitState: this.gauges.rpcCircuitState === 2
-        ? 'OPEN'
-        : (this.gauges.rpcCircuitState === 1 ? 'HALF_OPEN' : 'CLOSED'),
+      rpcCircuitState,
+      backlogSize,
+      retryBudgetPressure,
       paused: this.adminState.paused,
       pauseReason: this.adminState.reason,
       shard: { ...this.shardState },
+      healthIssues,
     };
   }
 }
@@ -149,11 +261,19 @@ function createDefaultGasMonitor() {
       forecastingEnabled: false,
       forecastSafetyBuffer: 0,
       forecastAggregationWindow: 0,
+      dynamicFeeMultiplier: 1,
     }),
     getForecasterState: () => ({
       trackedTasks: 0,
       totalHistoricalSamples: 0,
+      priceState: {
+        shortTermAverage: 0,
+        longTermAverage: 0,
+        trend: 0,
+        multiplier: 1,
+      },
     }),
+    getDynamicFeeMultiplier: () => 1,
   };
 }
 
@@ -191,6 +311,21 @@ class MetricsServer {
       logger: createLogger('reputation-scorer'),
     });
     this.register = new promClient.Registry();
+
+    // SLO metrics — injectable for testing; shares main registry by default so
+    // SLO histograms/counters appear at /metrics/prometheus without extra merging.
+    this.sloMetrics = options.sloMetrics || new SloMetrics({
+      register: this.register,
+      freshnessTargetSeconds: options.sloFreshnessTargetSeconds,
+      freshnessWarningSeconds: options.sloFreshnessWarningSeconds,
+      freshnessCriticalSeconds: options.sloFreshnessCriticalSeconds,
+      latenessTargetSeconds: options.sloLatenessTargetSeconds,
+      latenessWarningSeconds: options.sloLatenessWarningSeconds,
+      latenessCriticalSeconds: options.sloLatenessCriticalSeconds,
+      sloTarget: options.sloTarget,
+      errorBudgetWindowSize: options.sloErrorBudgetWindowSize,
+    });
+
     this.initPrometheusMetrics();
   }
 
@@ -316,6 +451,16 @@ class MetricsServer {
       help: 'RPC circuit breaker state (0 = CLOSED, 1 = HALF_OPEN, 2 = OPEN)',
       registers: [this.register],
     });
+    this.promBacklogSize = new promClient.Gauge({
+      name: 'keeper_backlog_size',
+      help: 'Number of task IDs currently known to the keeper registry',
+      registers: [this.register],
+    });
+    this.promRetryBudgetPressure = new promClient.Gauge({
+      name: 'keeper_retry_budget_pressure',
+      help: 'Current global retry budget pressure as a fraction between 0 and 1',
+      registers: [this.register],
+    });
     this.promAdminPaused = new promClient.Gauge({
       name: 'keeper_admin_paused',
       help: 'Whether the keeper is administratively paused (1 = paused, 0 = active)',
@@ -331,6 +476,26 @@ class MetricsServer {
       name: 'keeper_shard_skipped_tasks',
       help: 'Number of tasks skipped because they are assigned to another shard',
       labelNames: ['shard_label', 'shard_index'],
+      registers: [this.register],
+    });
+    this.promDbShardCount = new promClient.Gauge({
+      name: 'keeper_db_shard_count',
+      help: 'Number of Postgres database shards currently active',
+      registers: [this.register],
+    });
+    this.promDbShardActiveUsers = new promClient.Gauge({
+      name: 'keeper_db_shard_active_users',
+      help: 'Active user load used for Postgres shard scaling',
+      registers: [this.register],
+    });
+    this.promDbShardPendingTasks = new promClient.Gauge({
+      name: 'keeper_db_shard_pending_tasks',
+      help: 'Pending task volume used for Postgres shard scaling',
+      registers: [this.register],
+    });
+    this.promDbShardStrategy = new promClient.Gauge({
+      name: 'keeper_db_shard_strategy',
+      help: 'Current Postgres shard scaling mode (0 = fixed, 1 = auto)',
       registers: [this.register],
     });
     this.promDriftSeverity = new promClient.Gauge({
@@ -423,6 +588,8 @@ class MetricsServer {
     this.promUptime.set(Math.floor((Date.now() - this.metrics.startTime) / 1000));
     this.promRpcConnected.set(this.metrics.rpcConnected ? 1 : 0);
     this.promRpcCircuitState.set(this.metrics.gauges.rpcCircuitState);
+    this.promBacklogSize.set(this.metrics.lastBacklogSize || 0);
+    this.promRetryBudgetPressure.set(this.metrics.retryPressure || 0);
     this.promAdminPaused.set(this.metrics.adminState.paused ? 1 : 0);
     this.promShardOwnedTasks.set(
       {
@@ -446,6 +613,10 @@ class MetricsServer {
     this.promDriftTask.set(this.metrics.driftState.taskId || 0);
     this.promDriftWarningCount.set(this.metrics.driftState.warning || 0);
     this.promDriftCriticalCount.set(this.metrics.driftState.critical || 0);
+    this.promDbShardCount.set(this.metrics.dbShardState.dbShardCount);
+    this.promDbShardActiveUsers.set(this.metrics.dbShardState.activeUsers);
+    this.promDbShardPendingTasks.set(this.metrics.dbShardState.pendingTasks);
+    this.promDbShardStrategy.set(this.metrics.dbShardState.dbShardStrategy === 'auto' ? 1 : 0);
 
     if (this.retryBudgetTracker) {
       const budgetStats = this.retryBudgetTracker.getStats();
@@ -531,6 +702,12 @@ class MetricsServer {
       } else if (req.url === '/metrics/reputation' || req.url === '/metrics/reputation/') {
         this.handleReputation(res);
 
+      } else if (req.url === '/metrics/slo' || req.url === '/metrics/slo/') {
+        this.handleSloMetrics(res);
+
+      } else if (url.pathname === '/metrics/history' || url.pathname === '/metrics/history/') {
+        this.handleMetricsHistory(req, res);
+
       } else if (req.url === '/admin/billing' || req.url === '/admin/billing/') {
         protect(() => this.handleBilling(res))();
 
@@ -588,10 +765,21 @@ class MetricsServer {
         retryBudget: this.retryBudgetTracker.getStats(),
       }),
     };
-    res.writeHead(status.status === 'stale' ? 503 : 200, {
+    res.writeHead(['stale', 'unhealthy'].includes(status.status) ? 503 : 200, {
       'Content-Type': 'application/json',
     });
     res.end(JSON.stringify(healthData, null, 2));
+  }
+
+  handleMetricsHistory(req, res) {
+    const url = new URL(req.url || '/metrics/history', 'http://localhost');
+    const limit = Math.min(
+      parseInt(url.searchParams.get('limit') || '60', 10),
+      this.metrics.history.maxSamples,
+    );
+    const samples = this.metrics.history.getSamples(limit);
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ samples, count: samples.length }, null, 2));
   }
 
   handleMetrics(res) {
@@ -693,6 +881,19 @@ class MetricsServer {
         currency: 'request-units',
       },
     }, null, 2));
+  }
+
+  /**
+   * GET /metrics/slo — SLO snapshot in JSON.
+   *
+   * Returns poll freshness status, error budget consumption, lateness SLI data,
+   * configured SLO targets, and documented known measurement limitations.
+   * This endpoint is unauthenticated (read-only, no sensitive data).
+   */
+  handleSloMetrics(res) {
+    const snapshot = this.sloMetrics.getSnapshot();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(snapshot, null, 2));
   }
 
   handleDrift(res) {
@@ -820,6 +1021,7 @@ class MetricsServer {
       this.promAvgFee.set(this.metrics.gauges.avgFeePaidXlm);
     } else if (key === 'lastCycleDurationMs') {
       this.promCycleDuration.set(value);
+      this.metrics.recordHistoryPoint();
     } else if (key === 'lastRetryCycleDurationMs') {
       this.promRetryCycleDuration.set(value);
     } else if (key === 'rpcCircuitState') {
@@ -829,6 +1031,10 @@ class MetricsServer {
 
   updateShardState(state) {
     this.metrics.updateShardState(state);
+  }
+
+  updateDbShardState(state) {
+    this.metrics.updateDbShardState(state);
   }
 
   updateDriftState(state) {
@@ -860,4 +1066,4 @@ class MetricsServer {
   }
 }
 
-module.exports = { Metrics, MetricsServer };
+module.exports = { Metrics, MetricsHistory, MetricsServer };
