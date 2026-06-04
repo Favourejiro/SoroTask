@@ -1,3 +1,12 @@
+const EventEmitter = require("events");
+const { createRateLimiter } = require("./concurrency");
+const { createLogger } = require("./logger");
+const { acquireLock, releaseLock } = require("./lock");
+const { RetryScheduler } = require("./retryScheduler");
+
+// Locker logger for lock release operations
+const lockerLogger = createLogger('locker');
+
 const EventEmitter = require('events');
 const { createRateLimiter } = require('./concurrency');
 const { createLogger } = require('./logger');
@@ -78,21 +87,12 @@ function buildTaskItem(task) {
 }
 
 class ExecutionQueue extends EventEmitter {
-  constructor(limit, metricsServer, options = {}) {
+  constructor(limit, metricsServer, arg = {}, options = {}) {
     super();
 
-    const legacyRetryScheduler =
-      options
-      && typeof options === 'object'
-      && !Object.prototype.hasOwnProperty.call(options, 'retryScheduler')
-      && !Object.prototype.hasOwnProperty.call(options, 'idempotencyGuard')
-      && typeof options.scheduleRetry === 'function';
-
-    const normalizedOptions = legacyRetryScheduler
-      ? { retryScheduler: options, distributedLockEnabled: false }
-      : options;
-
-    this.logger = normalizedOptions.logger || createLogger('queue');
+    // Determine logger: can be provided either in options or as third arg if it's an options object
+    this.logger = (arg && arg.logger) || (options && options.logger) || createLogger('queue');
+    this.logger = options.logger || createLogger('queue');
     this.metricsServer = metricsServer;
     this.idempotencyGuard = options.idempotencyGuard || null;
 
@@ -111,6 +111,9 @@ class ExecutionQueue extends EventEmitter {
       10,
     );
 
+    // Determine maxWritesPerSecond from arg if options style or options
+    const mwps = (arg && arg.maxWritesPerSecond) || (options && options.maxWritesPerSecond) || process.env.MAX_WRITES_PER_SECOND || 5;
+    this.maxWritesPerSecond = parseInt(mwps, 10);
     this.maxWritesPerSecond = parseInt(
       normalizedOptions.maxWritesPerSecond || process.env.MAX_WRITES_PER_SECOND || DEFAULT_WRITES_PER_SECOND,
       10,
@@ -128,6 +131,32 @@ class ExecutionQueue extends EventEmitter {
       },
       compare: options.taskComparator || defaultTaskComparator,
     });
+    this.metricsServer = metricsServer;
+
+    // Determine idempotencyGuard and retryScheduler from args
+    let idempotencyGuard = null;
+    let retryScheduler = null;
+
+    if (arg && typeof arg.scheduleRetry === 'function') {
+      // Third argument is a retry scheduler directly (legacy test style)
+      retryScheduler = arg;
+    } else if (arg) {
+      // Third argument is an options object
+      idempotencyGuard = arg.idempotencyGuard || null;
+      retryScheduler = arg.retryScheduler || null;
+    }
+
+    this.idempotencyGuard = idempotencyGuard || (options && options.idempotencyGuard) || null;
+    retryScheduler = retryScheduler || (options && options.retryScheduler) || null;
+
+    // If no retryScheduler provided, create a default one
+    if (!retryScheduler) {
+      retryScheduler = new RetryScheduler();
+    }
+    this.retryScheduler = retryScheduler;
+
+    // Map to store due ledger for tasks
+    this.taskDueInfo = new Map();
 
     this.distributedLockEnabled = normalizedOptions.distributedLockEnabled !== false;
 
@@ -159,27 +188,51 @@ class ExecutionQueue extends EventEmitter {
     return limited;
   }
 
-  _shouldSkipTask(taskId) {
-    if (this.failedTasks.has(taskId) || this.retryTaskIds.has(taskId)) {
-      return true;
-    }
-
-    if (this.retryScheduler && typeof this.retryScheduler.getRetryMetadata === 'function') {
-      return !!this.retryScheduler.getRetryMetadata(taskId);
-    }
-
-    return false;
+  /**
+   * Initialize the queue and its retry scheduler.
+   */
+  async initialize() {
+    await this.retryScheduler.initialize();
   }
 
-  _buildTaskMeta(taskItem) {
-    return {
-      priority: taskItem.priority,
-      dueAt: taskItem.dueAt,
-      queuedAt: taskItem.queuedAt,
-      taskId: taskItem.taskId,
-    };
+  /**
+   * Get retry tasks ready for execution, optionally limited.
+   * @param {number} limit - Maximum number of retries to return
+   * @returns {Array} Array of retry task metadata
+   */
+  getReadyRetries(limit = Infinity) {
+    const ready = this.retryScheduler.getReadyRetries();
+    // Mark these tasks as being considered for retry
+    ready.forEach(r => this.retryTaskIds.add(r.taskId));
+    if (limit && limit < ready.length) {
+      return ready.slice(0, limit);
+    }
+    return ready;
   }
 
+  /**
+   * Update retry queue size gauge in metrics.
+   */
+  _updateRetryQueueSize() {
+    if (this.metricsServer) {
+      const stats = this.retryScheduler.getStatistics();
+      this.metricsServer.setRetryQueueSize(stats.total);
+    }
+  }
+
+  async enqueue(taskIds, executorFn) {
+    // Normalize taskIds to objects with taskId and optional dueLedger
+    const taskInfos = taskIds.map(entry => {
+      if (typeof entry === 'object' && entry !== null && entry.taskId !== undefined) {
+        return entry;
+      }
+      return { taskId: entry, dueLedger: undefined };
+    }).filter(info => !this.failedTasks.has(info.taskId));
+
+    this.depth = taskInfos.length;
+   * Enqueue a batch of tasks for execution.
+   * Supports both simple taskId arrays and complex task objects with context.
+   */
   async enqueue(tasksToEnqueue, executorFn, taskConfigMap = {}) {
     if (this.shuttingDown) {
       this.logger.warn('Queue is shutting down, rejecting new execution batch', {
@@ -197,7 +250,21 @@ class ExecutionQueue extends EventEmitter {
     this.depth = taskItems.length;
 
     if (this.metricsServer) {
-      this.metricsServer.increment('tasksDueTotal', taskItems.length);
+      this.metricsServer.increment("tasksDueTotal", taskInfos.length);
+    }
+
+    const cycleStartTime = Date.now();
+
+    const cyclePromises = taskInfos.map((taskInfo) => {
+      return this.limit(async () => {
+        const { taskId, dueLedger } = taskInfo;
+        // Store due ledger for SLO tracking
+        if (dueLedger !== undefined) {
+          this.taskDueInfo.set(taskId, dueLedger);
+        }
+
+        let attemptContext = null;
+      this.metricsServer.increment('tasksDueTotal', validTasks.length);
     }
 
     const cycleStartTime = Date.now();
@@ -220,6 +287,10 @@ class ExecutionQueue extends EventEmitter {
             if (this.metricsServer) {
               this.metricsServer.increment('tasksSkippedIdempotencyTotal', 1);
             }
+            // Clean up due info if present
+            this.taskDueInfo.delete(taskId);
+            this.emit("task:skipped", taskId, {
+              reason: "idempotency_lock",
             this.emit('task:skipped', taskId, {
               reason: 'idempotency_lock',
               attemptId: lockResult.attemptId,
@@ -229,6 +300,62 @@ class ExecutionQueue extends EventEmitter {
           }
         }
 
+         this.inFlight++;
+         this.depth = Math.max(this.depth - 1, 0);
+
+         // Acquire distributed lock before executing
+         const lockTtl = parseInt(process.env.LOCK_TTL_MS || '60000', 10);
+         const token = await acquireLock(taskId, lockTtl);
+         if (!token) {
+           // Could not acquire lock; another keeper likely processing this task
+           this.taskDueInfo.delete(taskId);
+           this.emit('task:skipped', taskId, { reason: 'lock_contention' });
+           this.inFlight--; // decrement inFlight since we're skipping
+           return;
+         }
+
+         try {
+           // Emit started event now that lock is acquired
+           if (attemptContext) {
+             this.emit("task:started", taskId, attemptContext);
+           } else {
+             this.emit("task:started", taskId);
+           }
+
+           // Execute task and capture result
+           const result = attemptContext
+             ? await executorFn(taskId, attemptContext)
+             : await executorFn(taskId);
+
+          this.completed++;
+
+           // Remove from retry queue if it was there
+           await this.retryScheduler.completeRetry(taskId, true);
+           this._updateRetryQueueSize();
+
+           // Remove from failed set so task can be processed again in future cycles
+           this.failedTasks.delete(taskId);
+
+           if (this.metricsServer) {
+            this.metricsServer.increment("tasksExecutedTotal", 1);
+            // Record execution lateness if due info available
+            const dueLedger = this.taskDueInfo.get(taskId);
+            if (dueLedger !== undefined && result) {
+              const execLedger = result.ledger !== undefined ? result.ledger : (result.executionLedger ?? null);
+              if (execLedger !== null) {
+                this.metricsServer.recordTaskExecution({
+                  taskId,
+                  actualExecutionLedger: execLedger,
+                  scheduledDueLedger: dueLedger,
+                  success: true,
+                });
+              }
+            }
+            // Clean up due info after processing
+            this.taskDueInfo.delete(taskId);
+          } else {
+            // No metrics server - still clean up
+            this.taskDueInfo.delete(taskId);
         this.inFlight++;
         this.depth = Math.max(this.depth - 1, 0);
 
@@ -265,6 +392,59 @@ class ExecutionQueue extends EventEmitter {
               attemptId: attemptContext.attemptId,
             });
           }
+          this.emit("task:success", taskId);
+         } catch (error) {
+           this.failedCount++;
+           this.failedTasks.add(taskId);
+
+           // Schedule retry for retryable errors
+           const retryMetadata = this.retryScheduler.getRetryMetadata(taskId);
+           const currentAttempt = retryMetadata?.currentAttempt || 0;
+
+           const scheduleResult = await this.retryScheduler.scheduleRetry({
+             taskId,
+             error,
+             currentAttempt,
+             taskConfig: null,
+           });
+
+           if (this.metricsServer) {
+             this.metricsServer.increment("tasksFailedTotal", 1);
+             // Record retry delay if retry was scheduled
+             if (scheduleResult && scheduleResult.scheduled && scheduleResult.nextAttemptTime) {
+               const delayMs = scheduleResult.nextAttemptTime - Date.now();
+               this.metricsServer.recordRetryDelay(delayMs);
+             }
+             this._updateRetryQueueSize();
+           }
+
+           // If retry not scheduled (max retries exceeded), clean up due info
+           if (scheduleResult && !scheduleResult.scheduled) {
+             this.taskDueInfo.delete(taskId);
+           }
+
+           if (this.idempotencyGuard) {
+             this.idempotencyGuard.markFailed(taskId, {
+               attemptId: attemptContext?.attemptId,
+               lastError: error.message || String(error),
+             });
+           }
+           this.emit("task:failed", taskId, error);
+         } finally {
+           // Attempt to release the lock if we hold it
+           try {
+             if (token) {
+               const released = await releaseLock(taskId, token);
+               if (!released) {
+                 lockerLogger.warn('Lock release failed (token mismatch or expired)', { taskId });
+               }
+             }
+           } catch (err) {
+             lockerLogger.error('Error releasing lock', { taskId, error: err.message });
+           }
+
+           this.inFlight--;
+         }
 
           this.emit('task:success', taskId, attemptContext, result);
         } catch (error) {
@@ -313,6 +493,9 @@ class ExecutionQueue extends EventEmitter {
     this.activePromises.push(...cyclePromises);
 
     try {
+      await Promise.allSettled(cyclePromises);
+    } catch (_) {
+      // already handled
       await Promise.all(cyclePromises);
     } catch (error) {
       this.logger.debug('Execution cycle completed with some task-level failures', {
@@ -488,6 +671,80 @@ class ExecutionQueue extends EventEmitter {
     }
   }
 
+  async enqueueRetries(retryTasks, executorFn) {
+    if (retryTasks.length === 0) {
+      return;
+    }
+
+    this.depth += retryTasks.length;
+
+    const cycleStartTime = Date.now();
+
+    const cyclePromises = retryTasks.map((retryTask) => {
+      return this.limit(async () => {
+        const { taskId, nextAttemptTime } = retryTask;
+        this.inFlight++;
+        this.depth = Math.max(this.depth - 1, 0);
+
+        this.emit('retry:started', taskId, retryTask);
+
+        // Record time spent in retry queue
+        if (this.metricsServer) {
+          const now = Date.now();
+          const timeInQueueMs = now - nextAttemptTime;
+          if (timeInQueueMs >= 0) {
+            this.metricsServer.recordRetryTimeInQueue(timeInQueueMs);
+          }
+        }
+
+        try {
+          const result = await executorFn(taskId);
+          this.completed++;
+
+          // Process SLO for successful execution (if due info exists)
+          if (this.metricsServer) {
+            const dueLedger = this.taskDueInfo.get(taskId);
+            if (dueLedger !== undefined && result) {
+              const execLedger = result.ledger !== undefined ? result.ledger : (result.executionLedger ?? null);
+              if (execLedger !== null) {
+                this.metricsServer.recordTaskExecution({
+                  taskId,
+                  actualExecutionLedger: execLedger,
+                  scheduledDueLedger: dueLedger,
+                  success: true,
+                });
+              }
+            }
+            this.metricsServer.recordRetryAttempt('success');
+            this.metricsServer.increment('retriesExecutedTotal', 1);
+            this.metricsServer.increment('tasksExecutedTotal', 1);
+          }
+
+           // Mark retry as successful
+           await this.retryScheduler.completeRetry(taskId, true);
+           this._updateRetryQueueSize();
+
+           // Remove from failed set so task can be processed again in future cycles
+           this.failedTasks.delete(taskId);
+
+           if (this.metricsServer) {
+            this.metricsServer.recordRetryAttempt('failure');
+            this.metricsServer.increment('retriesFailedTotal', 1);
+          }
+
+          // If retry permanently failed (max retries exceeded), clean up due info
+          if (completeResult && completeResult.removed) {
+            this.taskDueInfo.delete(taskId);
+          }
+
+          this.emit('retry:failed', taskId, error, retryTask, completeResult);
+        } finally {
+          this.inFlight--;
+        }
+      });
+  /**
+   * Graceful shutdown with timeout handling.
+   */
   async gracefulShutdown(options = {}) {
     const drainTimeoutMs = parseInt(
       options.drainTimeoutMs || process.env.SHUTDOWN_DRAIN_TIMEOUT_MS || 30000,

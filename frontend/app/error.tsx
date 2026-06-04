@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect } from "react";
+import * as Sentry from "@/src/lib/errors/sentry";
 
 interface Props {
   error: Error & { digest?: string };
@@ -9,10 +10,18 @@ interface Props {
 
 export default function GlobalError({ error, reset }: Props) {
   useEffect(() => {
-    // Same pattern as ErrorBoundary — log locally, no sensitive data sent out
+    // Log to console
     console.error("[GlobalError]", {
       message: error.message,
       digest: error.digest,
+    });
+
+    // Report to Sentry
+    Sentry.captureSentryException(error, {
+      tags: {
+        type: "global_error",
+        ...(error.digest && { digest: error.digest }),
+      },
     });
   }, [error]);
 

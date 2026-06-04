@@ -30,6 +30,59 @@ function normalizeLogger(logger) {
  * based on last_run + interval <= current_ledger_timestamp.
  */
 class TaskPoller {
+   constructor(server, contractId, options = {}) {
+     this.server = server;
+     this.contractId = contractId;
+
+     // Structured logger for poller module
+     this.logger = options.logger || createLogger('poller');
+     this.metricsServer = options.metricsServer;
+
+     // Configuration with defaults
+     this.maxConcurrentReads = parseInt(
+       options.maxConcurrentReads || process.env.MAX_CONCURRENT_READS || 10,
+       10,
+     );
+     this.maxReadsPerSecond = parseInt(
+       options.maxReadsPerSecond || process.env.MAX_READS_PER_SECOND || 20,
+       10,
+     );
+
+     // Create rate limiter for parallel task reads
+     this.readLimit = createRateLimiter({
+       concurrency: this.maxConcurrentReads,
+       rps: this.maxReadsPerSecond,
+       logger: this.logger,
+       name: 'poller-reads',
+       onThrottle: (event) => {
+         if (this.metricsServer) {
+           this.metricsServer.increment('throttledRequestsTotal', { name: event.name });
+         }
+       },
+     });
+
+     // Statistics
+     this.stats = {
+       lastPollTime: null,
+       tasksChecked: 0,
+       tasksDue: 0,
+       tasksSkipped: 0,
+       errors: 0,
+     };
+
+     this.lastCycleInsights = {
+       backlogSize: 0,
+       dueCount: 0,
+       dueSoonCount: 0,
+       minSecondsUntilDue: null,
+       avgRpcLatencyMs: 0,
+       cycleDurationMs: 0,
+       errors: 0,
+     };
+
+     // Track last due task details for metrics
+     this.lastDueTaskDetails = []; // Array of { taskId, dueLedger }
+   }
   constructor(server, contractId, options = {}) {
     this.server = server;
     this.contractId = contractId;
@@ -170,6 +223,11 @@ class TaskPoller {
     this.stats.unacceptablyLate = 0;
     this.stats.errors = 0;
 
+    // Notify metrics that poll cycle started (for health staleness)
+    if (this.metricsServer) {
+      this.metricsServer.updateHealth({ lastPollAt: new Date(startTime) });
+    }
+
     const rpcLatencies = [];
     const secondsUntilDueValues = [];
 
@@ -272,7 +330,15 @@ class TaskPoller {
 
       // Collect due task IDs from successful checks
       const dueTaskIds = [];
-      const includeContext = options.includeContext === true;
+      const dueTaskDetails = []; // Track due ledger for each task
+
+      results.forEach((result, index) => {
+        if (result.status === 'fulfilled' && result.value) {
+          const { isDue, taskId, reason, nextRunTime } = result.value;
+
+          if (isDue) {
+            dueTaskIds.push(taskId);
+            dueTaskDetails.push({ taskId, dueLedger: nextRunTime });
       let warningDriftCount = 0;
       let criticalDriftCount = 0;
       let maxDriftSeconds = 0;
@@ -316,7 +382,7 @@ class TaskPoller {
           this.stats.tasksChecked++;
         } else if (result.status === 'rejected') {
           this.stats.errors++;
-          this.logger.error('Error checking task', { taskId: taskIds[index], error: result.reason?.message || result.reason });
+          this.logger.error('Error checking task', { taskId: candidateIds[index], error: result.reason?.message || result.reason });
         }
       });
 
@@ -339,6 +405,10 @@ class TaskPoller {
         errors: this.stats.errors,
       };
 
+      // Store due task details for metrics and observers
+      this.lastDueTaskDetails = dueTaskDetails;
+
+      this.logPollSummary(duration);
       if (this.metricsServer) {
         const retryStats = this.metricsServer.retryBudgetTracker?.getStats?.() || { global: { percentage: 0 } };
         this.metricsServer.increment('tasksCheckedTotal', this.stats.tasksChecked);
@@ -421,6 +491,13 @@ class TaskPoller {
   }
 
   /**
+      * Check a single task to determine if it's due for execution.
+      *
+      * @param {number} taskId - The task ID to check
+      * @param {number} currentTimestamp - Current ledger timestamp
+      * @returns {Promise<{isDue: boolean, taskId: number, reason?: string, secondsUntilDue: number|null, nextRunTime: number|null}>}
+      */
+  async checkTask(taskId, currentTimestamp, registry) {
      * Check a single task to determine if it's due for execution.
      *
      * @param {number} taskId - The task ID to check
@@ -460,6 +537,8 @@ class TaskPoller {
       }
 
       if (!taskConfig) {
+        this.logger.warn('Task not found (may have been deregistered)', { taskId });
+        return { isDue: false, taskId, reason: 'not_found', secondsUntilDue: null, nextRunTime: null };
         taskLogger.warn('Task not found (may have been deregistered)', { taskId });
         return { isDue: false, taskId, reason: 'not_found', correlationId };
       }
@@ -478,6 +557,8 @@ class TaskPoller {
 
       // Check gas balance
       if (taskConfig.gas_balance <= 0) {
+        this.logger.warn('Task has insufficient gas balance', { taskId, gasBalance: taskConfig.gas_balance });
+        return { isDue: false, taskId, reason: 'skipped', secondsUntilDue: null, nextRunTime: null };
         taskLogger.warn('Task has insufficient gas balance', { taskId, gasBalance: taskConfig.gas_balance });
         return { isDue: false, taskId, reason: 'skipped', correlationId };
       }
@@ -592,6 +673,7 @@ class TaskPoller {
         secondsUntilDue: Number.isFinite(effectiveNextRunTime)
           ? Math.max(0, effectiveNextRunTime - currentTimestamp)
           : null,
+        nextRunTime,
         driftSeconds,
         driftSeverity,
         resolver,
@@ -946,10 +1028,10 @@ class TaskPoller {
   }
 
   /**
-   * Get current polling statistics.
-   *
-   * @returns {Object} Current statistics
-   */
+    * Get current polling statistics.
+    *
+    * @returns {Object} Current statistics
+    */
   getStats() {
     return { ...this.stats };
   }
@@ -959,6 +1041,13 @@ class TaskPoller {
   }
 
   /**
+    * Get details of tasks identified as due in the most recent poll.
+    * Includes scheduled due ledger for each task.
+    *
+    * @returns {Array<{taskId: number, dueLedger: number}>}
+    */
+  getLastDueTaskDetails() {
+    return [...this.lastDueTaskDetails];
    * Invalidate cached simulation data for one or more tasks.
    * Call this after a task is executed to ensure fresh data on next poll.
    *

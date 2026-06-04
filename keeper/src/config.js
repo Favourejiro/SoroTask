@@ -2,6 +2,14 @@ const dotenv = require('dotenv');
 
 dotenv.config();
 
+ export function loadConfig() {
+   const required = [
+     'SOROBAN_RPC_URL',
+     'NETWORK_PASSPHRASE',
+     'KEEPER_SECRET',
+     'CONTRACT_ID',
+     'POLLING_INTERVAL_MS',
+   ];
 function parseInteger(value, fallback) {
   const parsed = parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
@@ -33,26 +41,15 @@ function loadConfig() {
     'POLLING_INTERVAL_MS',
   ];
 
-  const missing = required.filter((key) => !process.env[key]);
+   const missing = required.filter((key) => !process.env[key]);
 
-  if (missing.length > 0) {
-    throw new Error(
-      `Missing required environment variables: ${missing.join(', ')}`,
-    );
-  }
+   if (missing.length > 0) {
+     throw new Error(
+       `Missing required environment variables: ${missing.join(', ')}`,
+     );
+   }
 
-  const p2pEnabled = parseBoolean(process.env.P2P_ENABLED, false);
-  if (p2pEnabled && !process.env.P2P_SHARED_SECRET) {
-    throw new Error('P2P_SHARED_SECRET is required when P2P_ENABLED=true');
-  }
-
-  const inboundWebhooksEnabled = parseBoolean(process.env.INBOUND_WEBHOOKS_ENABLED, false);
-  const inboundWebhookSecrets = process.env.INBOUND_WEBHOOK_SECRETS
-    || process.env.INBOUND_WEBHOOK_SECRET
-    || '';
-  if (inboundWebhooksEnabled && !inboundWebhookSecrets) {
-    throw new Error('INBOUND_WEBHOOK_SECRET or INBOUND_WEBHOOK_SECRETS is required when INBOUND_WEBHOOKS_ENABLED=true');
-  }
+   const pollIntervalMs = parseInt(process.env.POLLING_INTERVAL_MS, 10) || 10000;
 
   const rpcUrlList = parseList(process.env.SOROBAN_RPC_URLS);
   const rpcUrls = Array.from(new Set([
@@ -92,6 +89,27 @@ function loadConfig() {
     metricsPort: parseInteger(process.env.METRICS_PORT, 3000),
     healthStaleThresholdMs: parseInteger(process.env.HEALTH_STALE_THRESHOLD_MS, 60000),
     adminApiToken: process.env.KEEPER_ADMIN_TOKEN || null,
+    fraudAlertWebhookUrl: process.env.FRAUD_ALERT_WEBHOOK_URL || null,
+    fraudAlertDebounceMs: parseInteger(process.env.FRAUD_ALERT_DEBOUNCE_MS, 600000),
+    fraudBurstWindowMs: parseInteger(process.env.FRAUD_BURST_WINDOW_MS, 300000),
+    fraudFailureWindowMs: parseInteger(process.env.FRAUD_FAILURE_WINDOW_MS, 600000),
+    fraudAlertThreshold: parseInteger(process.env.FRAUD_ALERT_THRESHOLD, 4),
+    fraudFeeSpikeMultiplier: parseFloat(process.env.FRAUD_FEE_SPIKE_MULTIPLIER) || 4,
+    fraudMinFeeSpike: parseInteger(process.env.FRAUD_MIN_FEE_SPIKE, 10),
+    fraudDrainMultiplier: parseFloat(process.env.FRAUD_DRAIN_MULTIPLIER) || 3,
+    fraudMinDrainFee: parseInteger(process.env.FRAUD_MIN_DRAIN_FEE, 50),
+    fraudTaskBurstThreshold: parseInteger(process.env.FRAUD_TASK_BURST_THRESHOLD, 5),
+    fraudFailureBurstThreshold: parseInteger(process.env.FRAUD_FAILURE_BURST_THRESHOLD, 3),
+    fraudCrossTaskThreshold: parseInteger(process.env.FRAUD_CROSS_TASK_THRESHOLD, 8),
+    fraudCrossTaskFeeThreshold: parseInteger(process.env.FRAUD_CROSS_TASK_FEE_THRESHOLD, 100),
+    fraudAlertWebhookTimeoutMs: parseInteger(process.env.FRAUD_ALERT_WEBHOOK_TIMEOUT_MS, 5000),
+    fraudAlertMaxAttempts: parseInteger(process.env.FRAUD_ALERT_MAX_ATTEMPTS, 3),
+    reconciliationAlertWebhookUrl: process.env.RECONCILIATION_ALERT_WEBHOOK_URL || null,
+    reconciliationAlertDebounceMs: parseInteger(process.env.RECONCILIATION_ALERT_DEBOUNCE_MS, 600000),
+    reconciliationExecutionSettlingMs: parseInteger(process.env.RECONCILIATION_EXECUTION_SETTLING_MS, 120000),
+    reconciliationTolerance: parseInteger(process.env.RECONCILIATION_TOLERANCE, 0),
+    reconciliationAlertWebhookTimeoutMs: parseInteger(process.env.RECONCILIATION_ALERT_WEBHOOK_TIMEOUT_MS, 5000),
+    reconciliationAlertMaxAttempts: parseInteger(process.env.RECONCILIATION_ALERT_MAX_ATTEMPTS, 3),
     shardIndex: parseInteger(process.env.KEEPER_SHARD_INDEX, 0),
     shardCount: parseInteger(process.env.KEEPER_SHARD_COUNT, 1),
     shardLabel: process.env.KEEPER_SHARD_LABEL || null,

@@ -71,6 +71,25 @@ LOG_LEVEL=info
 # KEEPER_STATE_DIR=./data
 # IDEMPOTENCY_STATE_FILE=./data/execution_locks.json
 
+ # Optional: lock expiration controls (milliseconds)
+ # EXECUTION_LOCK_TTL_MS=120000
+ # EXECUTION_COMPLETED_MARKER_TTL_MS=30000
+
+ # === SLO (Service Level Objectives) ===
+ # Maximum allowed milliseconds between poll cycle completions (freshness)
+ # SLO_POLL_FRESHNESS_MS=60000
+
+ # Maximum allowed execution lateness in milliseconds.
+ # If not set, defaults to 3x the polling interval.
+ # SLO_EXECUTION_TIMELINESS_MS=30000
+
+ # Approximate wall-clock time per ledger in milliseconds.
+ # Used to convert ledger-based timeliness measurements to wall-clock.
+ # LEDGER_TIME_MS=5000
+
+ # Maximum number of retry tasks to process each cycle (fair scheduling)
+ # MAX_RETRIES_PER_CYCLE=5
+ ```
 # Optional: lock expiration controls (milliseconds)
 # EXECUTION_LOCK_TTL_MS=120000
 # EXECUTION_COMPLETED_MARKER_TTL_MS=30000
@@ -79,6 +98,31 @@ LOG_LEVEL=info
 METRICS_PORT=3000
 HEALTH_STALE_THRESHOLD_MS=60000
 # KEEPER_ADMIN_TOKEN=replace-with-strong-random-token
+
+# Fraud / anomaly alerting
+# FRAUD_ALERT_WEBHOOK_URL=https://alerts.example.com/keeper-fraud
+# FRAUD_ALERT_DEBOUNCE_MS=600000
+# FRAUD_BURST_WINDOW_MS=300000
+# FRAUD_FAILURE_WINDOW_MS=600000
+# FRAUD_ALERT_THRESHOLD=4
+# FRAUD_FEE_SPIKE_MULTIPLIER=4
+# FRAUD_MIN_FEE_SPIKE=10
+# FRAUD_DRAIN_MULTIPLIER=3
+# FRAUD_MIN_DRAIN_FEE=50
+# FRAUD_TASK_BURST_THRESHOLD=5
+# FRAUD_FAILURE_BURST_THRESHOLD=3
+# FRAUD_CROSS_TASK_THRESHOLD=8
+# FRAUD_CROSS_TASK_FEE_THRESHOLD=100
+# FRAUD_ALERT_WEBHOOK_TIMEOUT_MS=5000
+# FRAUD_ALERT_MAX_ATTEMPTS=3
+
+# Reconciliation / accounting alerting
+# RECONCILIATION_ALERT_WEBHOOK_URL=https://alerts.example.com/keeper-reconciliation
+# RECONCILIATION_ALERT_DEBOUNCE_MS=600000
+# RECONCILIATION_EXECUTION_SETTLING_MS=120000
+# RECONCILIATION_TOLERANCE=0
+# RECONCILIATION_ALERT_WEBHOOK_TIMEOUT_MS=5000
+# RECONCILIATION_ALERT_MAX_ATTEMPTS=3
 
 # Stable work partitioning across keeper instances
 KEEPER_SHARD_INDEX=0
@@ -127,9 +171,37 @@ RESOLVER_FAILURE_MODE=skip
 - **`LOG_LEVEL`**: Minimum log severity to emit (`trace`, `debug`, `info`, `warn`, `error`, `fatal`).
 - **`LOG_FORMAT`**: Optional log renderer. Leave unset for JSON logs; set to `pretty` for local human-readable output.
 - **`KEEPER_STATE_DIR` / `IDEMPOTENCY_STATE_FILE`**: Location of persisted execution idempotency locks used to prevent duplicate submissions.
+ - **`EXECUTION_LOCK_TTL_MS`**: How long an in-progress execution lock is considered valid before stale recovery allows new work.
+ - **`EXECUTION_COMPLETED_MARKER_TTL_MS`**: Short-lived post-success marker to reduce accidental immediate duplicate submissions.
+
+ - **`SLO_POLL_FRESHNESS_MS`**: Maximum allowed milliseconds between poll cycle completions. A poll taking longer than this increments the freshness SLO failure counter.
+ - **`SLO_EXECUTION_TIMELINESS_MS`**: Maximum allowed execution lateness (ms). Tasks completing after this delay count as timeliness SLO failures. Defaults to 3 × `POLLING_INTERVAL_MS`.
+ - **`LEDGER_TIME_MS`**: Estimated wall-clock milliseconds per ledger closure. Used to convert ledger-based lateness to milliseconds for SLO evaluation (default: 5000).
+ - **`MAX_RETRIES_PER_CYCLE`**: Maximum number of retry tasks to process in a single cycle (fair scheduling). Default: 5.
 - **`EXECUTION_LOCK_TTL_MS`**: How long an in-progress execution lock is considered valid before stale recovery allows new work.
 - **`EXECUTION_COMPLETED_MARKER_TTL_MS`**: Short-lived post-success marker to reduce accidental immediate duplicate submissions.
 - **`KEEPER_ADMIN_TOKEN`**: Bearer token required to call the keeper admin pause/resume API.
+- **`FRAUD_ALERT_WEBHOOK_URL`**: Optional webhook target that receives fraud/anomaly alerts as JSON.
+- **`FRAUD_ALERT_DEBOUNCE_MS`**: Minimum time between duplicate alerts for the same signature.
+- **`FRAUD_BURST_WINDOW_MS`**: Rolling window used for burst and drain heuristics.
+- **`FRAUD_FAILURE_WINDOW_MS`**: Rolling failure window used for repeated error detection.
+- **`FRAUD_ALERT_THRESHOLD`**: Minimum heuristic score required before an alert is queued.
+- **`FRAUD_FEE_SPIKE_MULTIPLIER`**: Fee multiplier used to flag sudden execution cost spikes.
+- **`FRAUD_MIN_FEE_SPIKE`**: Minimum absolute fee value before a spike can alert.
+- **`FRAUD_DRAIN_MULTIPLIER`**: Rolling-window fee growth multiplier used for rapid-drain detection.
+- **`FRAUD_MIN_DRAIN_FEE`**: Minimum rolling fee volume before a drain alert can trigger.
+- **`FRAUD_TASK_BURST_THRESHOLD`**: Number of executions of the same task in the window before it is considered bursty.
+- **`FRAUD_FAILURE_BURST_THRESHOLD`**: Number of failures in the window before it is considered a failure storm.
+- **`FRAUD_CROSS_TASK_THRESHOLD`**: Distinct task count in the window before cross-task velocity becomes suspicious.
+- **`FRAUD_CROSS_TASK_FEE_THRESHOLD`**: Total fee volume required for cross-task velocity alerts.
+- **`FRAUD_ALERT_WEBHOOK_TIMEOUT_MS`**: Timeout for outbound fraud alert webhook delivery.
+- **`FRAUD_ALERT_MAX_ATTEMPTS`**: Number of delivery attempts before an alert is marked failed.
+- **`RECONCILIATION_ALERT_WEBHOOK_URL`**: Optional webhook target for balance-vs-fee reconciliation mismatches.
+- **`RECONCILIATION_ALERT_DEBOUNCE_MS`**: Minimum time between duplicate reconciliation alerts for the same signature.
+- **`RECONCILIATION_EXECUTION_SETTLING_MS`**: Grace period before an unmatched execution is escalated.
+- **`RECONCILIATION_TOLERANCE`**: Accepted balance drift tolerance; keep at `0` for exact accounting.
+- **`RECONCILIATION_ALERT_WEBHOOK_TIMEOUT_MS`**: Timeout for outbound reconciliation alert webhook delivery.
+- **`RECONCILIATION_ALERT_MAX_ATTEMPTS`**: Number of delivery attempts before a reconciliation alert is marked failed.
 - **`KEEPER_SHARD_INDEX` / `KEEPER_SHARD_COUNT`**: Stable shard assignment controls so multiple keeper instances can partition work without ambiguous ownership.
 - **`KEEPER_SHARD_LABEL`**: Optional human-readable shard identifier used in metrics and logs.
 - **`DB_SHARD_BASE_COUNT` / `DB_SHARD_MAX_COUNT`**: Minimum and maximum Postgres shard counts for automatic scaling. The manager scales shard usage within these bounds.
@@ -218,6 +290,9 @@ DLQ_MAX_RECORDS=1000
 ```
 
 The DLQ automatically isolates tasks that fail repeatedly, preventing resource waste and providing diagnostic information for operators. See [Dead-Letter Queue Documentation](./docs/dead-letter-queue.md) for details.
+
+For fraud and anomaly alerting, see [Fraud Detection and Anomaly Alerting](./docs/fraud-detection.md).
+For strict fee-vs-balance accounting, see [Real-time Financial Reconciliation](./docs/reconciliation.md).
 
 ## Setup Instructions
 

@@ -32,11 +32,11 @@ describe('Metrics', () => {
     expect(metrics.gauges.lastCycleDurationMs).toBe(100);
   });
 
-  it('should return snapshot', () => {
-    const snapshot = metrics.snapshot();
-    expect(snapshot).toBeDefined();
-    expect(typeof snapshot).toBe('object');
-  });
+   it('should return snapshot', () => {
+     const snapshot = metrics.snapshot();
+     expect(snapshot).toBeDefined();
+     expect(typeof snapshot).toBe('object');
+   });
 
   it('should store failover state in snapshot', () => {
     metrics.updateFailoverState({

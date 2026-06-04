@@ -39,9 +39,29 @@ pub enum Error {
     KeeperStakeTooLow = 14,
     OperatorAlreadySet = 15,
     // Payload validation errors
-    ArgsTooMany = 16,
-    ArgsTooLarge = 17,
-    InvalidPayload = 18,
+    ArgsTooMany = 14,
+    ArgsTooLarge = 15,
+    InvalidPayload = 16,
+    ReentrantCall = 17,
+    DependencyLimitExceeded = 18,
+    DependencyDepthExceeded = 19,
+    // VRF-related errors
+    VrfOracleNotSet = 20,
+    InvalidVrfRequest = 21,
+    VrfRequestFailed = 22,
+    VrfAlreadyFulfilled = 23,
+    // Yield strategy-related errors
+    YieldStrategyNotInitialized = 24,
+    InvalidYieldStrategy = 25,
+    YieldHarvestFailed = 26,
+    InsufficientYield = 27,
+    // Oracle-related errors
+    OracleNotSet = 28,
+    OracleRequestFailed = 29,
+    OracleInvalidResponse = 30,
+    OracleTimeout = 31,
+    OracleUnsupportedProvider = 32,
+    InvalidInsurancePolicy = 33,
 }
 
 /// Maximum number of arguments allowed in a task payload
@@ -330,6 +350,28 @@ pub struct VrfResponse {
 }
 
 #[contracttype]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum ClaimStatus {
+    Active,
+    Submitted,
+    Paid,
+    Rejected,
+}
+
+#[contracttype]
+#[derive(Clone, Debug)]
+pub struct InsurancePolicy {
+    pub policy_id: u64,
+    pub owner: Address,
+    pub task_id: u64,
+    pub premium_paid: i128,
+    pub coverage_amount: i128,
+    pub status: ClaimStatus,
+    pub created_at: u64,
+    pub failure_reason: Bytes,
+}
+
+#[contracttype]
 #[derive(Clone, Debug)]
 pub struct ZkCondition {
     pub task_id: u64,
@@ -364,6 +406,12 @@ pub enum DataKey {
     VrfRequestCounter,
     VrfRequests(u64),
     VrfResponses(u64),
+    OracleConfig(OracleProvider),
+    OracleRequestCounter,
+    OracleRequests(u64),
+    OracleResponses(u64),
+    InsurancePolicyCounter,
+    InsurancePolicy(u64),
     YieldStrategyCounter,
     YieldStrategies(u64),
     ReentrancyLock,
@@ -445,6 +493,124 @@ fn set_keeper_stake(env: &Env, keeper: &Address, amount: i128) {
     env.storage()
         .persistent()
         .set(&DataKey::KeeperStake(keeper.clone()), &amount);
+}
+
+#[contract]
+pub struct InsuranceContract;
+
+#[contractimpl]
+impl InsuranceContract {
+    pub fn create_policy(
+        env: Env,
+        task_id: u64,
+        premium_paid: i128,
+        coverage_amount: i128,
+    ) -> u64 {
+        if premium_paid <= 0 || coverage_amount <= 0 {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
+
+        let mut counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::InsurancePolicyCounter)
+            .unwrap_or(0);
+        counter += 1;
+        env.storage().instance().set(&DataKey::InsurancePolicyCounter, &counter);
+
+        let owner = env.invoker();
+        owner.require_auth();
+
+        let policy = InsurancePolicy {
+            policy_id: counter,
+            owner: owner.clone(),
+            task_id,
+            premium_paid,
+            coverage_amount,
+            status: ClaimStatus::Active,
+            created_at: env.ledger().timestamp(),
+            failure_reason: Bytes::new(&env),
+        };
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsurancePolicy(counter), &policy);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "InsurancePolicyCreated"),
+                Symbol::new(&env, "v1"),
+                counter,
+            ),
+            owner,
+        );
+
+        counter
+    }
+
+    pub fn submit_claim(env: Env, policy_id: u64, failure_reason: Bytes) {
+        let mut policy: InsurancePolicy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsurancePolicy(policy_id))
+            .expect("Insurance policy not found");
+
+        policy.owner.require_auth();
+
+        if policy.status != ClaimStatus::Active {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
+
+        policy.status = ClaimStatus::Submitted;
+        policy.failure_reason = failure_reason.clone();
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsurancePolicy(policy_id), &policy);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "InsuranceClaimSubmitted"),
+                Symbol::new(&env, "v1"),
+                policy_id,
+            ),
+            failure_reason,
+        );
+    }
+
+    pub fn settle_claim(env: Env, policy_id: u64) {
+        let mut policy: InsurancePolicy = env
+            .storage()
+            .persistent()
+            .get(&DataKey::InsurancePolicy(policy_id))
+            .expect("Insurance policy not found");
+
+        policy.owner.require_auth();
+
+        if policy.status != ClaimStatus::Submitted {
+            panic_with_error!(&env, Error::InvalidInsurancePolicy);
+        }
+
+        policy.status = ClaimStatus::Paid;
+        env.storage()
+            .persistent()
+            .set(&DataKey::InsurancePolicy(policy_id), &policy);
+
+        env.events().publish(
+            (
+                Symbol::new(&env, "InsuranceClaimSettled"),
+                Symbol::new(&env, "v1"),
+                policy_id,
+            ),
+            policy.coverage_amount,
+        );
+    }
+
+    pub fn get_policy(env: Env, policy_id: u64) -> Option<InsurancePolicy> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::InsurancePolicy(policy_id))
+    }
 }
 
 #[contracttype]
@@ -806,6 +972,138 @@ impl SoroTaskContract {
             (task_id, config.creator.clone()),
         );
         
+        exit_security_guard(&env);
+    }
+
+    /// Sets the configuration for a specific Oracle provider.
+    pub fn set_oracle_config(env: Env, provider: OracleProvider, oracle_address: Address, active: bool) {
+        enter_security_guard(&env);
+        
+        let config = OracleConfig {
+            address: oracle_address.clone(),
+            provider: provider.clone(),
+            active,
+        };
+        env.storage().instance().set(&DataKey::OracleConfig(provider.clone()), &config);
+
+        env.events().publish(
+            (Symbol::new(&env, "OracleConfigSet"), provider),
+            oracle_address,
+        );
+        exit_security_guard(&env);
+    }
+
+    /// Requests external data from a Decentralized Oracle Network.
+    pub fn request_oracle_data(
+        env: Env,
+        task_id: u64,
+        provider: OracleProvider,
+        job_id: Symbol,
+        callback_function: Symbol,
+        callback_args: Vec<Val>,
+    ) {
+        enter_security_guard(&env);
+        
+        let config: OracleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleConfig(provider.clone()))
+            .ok_or(Error::OracleNotSet)
+            .expect("Oracle provider not configured");
+        
+        if !config.active {
+            panic_with_error!(&env, Error::OracleNotSet);
+        }
+
+        let task_key = DataKey::Task(task_id);
+        let task: TaskConfig = env
+            .storage()
+            .persistent()
+            .get(&task_key)
+            .ok_or(Error::TaskNotFound)
+            .expect("Task not found");
+        
+        task.creator.require_auth();
+
+        let mut request_counter: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleRequestCounter)
+            .unwrap_or(0);
+        request_counter += 1;
+        env.storage().instance().set(&DataKey::OracleRequestCounter, &request_counter);
+
+        let request = OracleDataRequest {
+            request_id: request_counter,
+            task_id,
+            requester: task.creator.clone(),
+            provider: provider.clone(),
+            job_id: job_id.clone(),
+            callback_function,
+            callback_args,
+            status: OracleRequestStatus::Pending,
+            created_at: env.ledger().timestamp(),
+            max_retries: 3,
+            retry_count: 0,
+        };
+
+        env.storage().persistent().set(&DataKey::OracleRequests(request_counter), &request);
+
+        env.events().publish(
+            (Symbol::new(&env, "OracleDataRequested"), provider, request_counter),
+            (task_id, job_id),
+        );
+        
+        exit_security_guard(&env);
+    }
+
+    /// Fulfill an oracle request with data. Called by the Oracle provider contract.
+    pub fn fulfill_oracle_data(
+        env: Env,
+        caller: Address,
+        request_id: u64,
+        data: Bytes,
+    ) {
+        enter_security_guard(&env);
+        caller.require_auth();
+
+        let mut request: OracleDataRequest = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleRequests(request_id))
+            .expect("Oracle request not found");
+
+        if request.status != OracleRequestStatus::Pending {
+            panic_with_error!(&env, Error::OracleInvalidResponse);
+        }
+
+        let config: OracleConfig = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleConfig(request.provider.clone()))
+            .expect("Oracle config not found");
+        
+        if caller != config.address {
+            panic_with_error!(&env, Error::Unauthorized);
+        }
+        
+        request.status = OracleRequestStatus::Fulfilled;
+        env.storage().persistent().set(&DataKey::OracleRequests(request_id), &request);
+
+        let response = OracleDataResponse {
+            request_id,
+            data,
+            timestamp: env.ledger().timestamp(),
+            provider: request.provider.clone(),
+        };
+
+        env.storage().persistent().set(&DataKey::OracleResponses(request_id), &response);
+
+        env.events().publish(
+            (Symbol::new(&env, "OracleDataFulfilled"), request.provider),
+            request_id,
+        );
+
         exit_security_guard(&env);
     }
 
@@ -3364,7 +3662,7 @@ impl SoroTaskContract {
 mod test_gas;
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use soroban_sdk::{
         contract, contractimpl,
@@ -3570,7 +3868,7 @@ mod tests {
     }
 
     #[allow(dead_code)]
-    pub fn update_task(env: Env, task_id: u64, new_config: TaskConfig) {
+    pub(crate) fn update_task(env: Env, task_id: u64, new_config: TaskConfig) {
         let task_key = DataKey::Task(task_id);
 
         let existing: TaskConfig = env
@@ -5319,7 +5617,13 @@ mod tests {
         // Create proposal
         let title = vec![&env, b"Test Proposal".to_vec()];
         let description = vec![&env, b"This is a test proposal".to_vec()];
-        let proposal_id = client.create_proposal(&title, &description, &10000);
+        let proposal_id = client.create_proposal(
+            &title,
+            &description,
+            &10000,
+            &ProposalType::Other,
+            &Vec::new(&env),
+        );
 
         // Verify proposal was created
         let proposal = client.get_governance_proposal(&proposal_id).unwrap();
@@ -5332,6 +5636,145 @@ mod tests {
         // Verify votes were recorded
         let updated_proposal = client.get_governance_proposal(&proposal_id).unwrap();
         assert_eq!(updated_proposal.votes_for, 50);
+    }
+
+    #[test]
+    fn test_governance_proposal_execution() {
+        let (env, id) = setup();
+        let client = SoroTaskContractClient::new(&env, &id);
+
+        let token_admin = env.current_contract_address();
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone());
+        let token_address = token_id.address();
+        let token_admin_client = soroban_sdk::token::StellarAssetClient::new(&env, &token_address);
+
+        client.init(&token_address);
+        client.init_staking_pool(&500);
+
+        let proposer = env.current_contract_address();
+        token_admin_client.mint(&proposer, &1000);
+        client.stake_tokens(&100);
+
+        let title = vec![&env, b"Governance Execution".to_vec()];
+        let description = vec![&env, b"Execute tokenomics update".to_vec()];
+        let mut payload: Vec<Val> = Vec::new(&env);
+        payload.push_back(100_i128.into_val(&env));
+        payload.push_back(1000_i128.into_val(&env));
+        payload.push_back(3_600_000_i128.into_val(&env));
+        payload.push_back(2_i128.into_val(&env));
+        payload.push_back(50_i128.into_val(&env));
+        payload.push_back(10000_i128.into_val(&env));
+
+        let proposal_id = client.create_proposal(
+            &title,
+            &description,
+            &10000,
+            &ProposalType::UpdateTokenomicsConfig,
+            &payload,
+        );
+
+        client.vote_on_proposal(&proposal_id, &true, &50);
+        client.execute_proposal(&proposal_id);
+
+        let executed = client.get_governance_proposal(&proposal_id).unwrap();
+        assert_eq!(executed.status, ProposalStatus::Executed);
+
+        let updated_config = client.get_tokenomics_config();
+        assert_eq!(updated_config.staking_reward_rate, 100);
+        assert_eq!(updated_config.governance_quorum_percentage, 1000);
+        assert_eq!(updated_config.fee_model, FeeModel::Dynamic);
+    }
+
+    #[test]
+    fn test_oracle_multi_provider_lifecycle() {
+        let (env, id) = setup();
+        let client = SoroTaskContractClient::new(&env, &id);
+
+        let target = env.register_contract(None, MockTarget);
+        let task_id = client.register(&base_config(&env, target.clone()));
+
+        let oracle_chainlink = env.register_contract(None, MockTarget);
+        let oracle_band = env.register_contract(None, MockTarget);
+
+        client.set_oracle_config(&OracleProvider::Chainlink, &oracle_chainlink, &true);
+        client.set_oracle_config(&OracleProvider::Band, &oracle_band, &true);
+
+        client.request_oracle_data(
+            &task_id,
+            &OracleProvider::Chainlink,
+            &Symbol::new(&env, "job1"),
+            &Symbol::new(&env, "callback"),
+            &Vec::new(&env),
+        );
+
+        let first_request_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleRequestCounter)
+            .unwrap_or(0);
+
+        client.fulfill_oracle_data(
+            &oracle_chainlink,
+            &first_request_id,
+            &Bytes::from_slice(&env, b"chainlink-data"),
+        );
+
+        let first_response: OracleDataResponse = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleResponses(first_request_id))
+            .expect("Oracle response not found");
+        assert_eq!(first_response.provider, OracleProvider::Chainlink);
+
+        client.request_oracle_data(
+            &task_id,
+            &OracleProvider::Band,
+            &Symbol::new(&env, "job2"),
+            &Symbol::new(&env, "callback"),
+            &Vec::new(&env),
+        );
+
+        let second_request_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::OracleRequestCounter)
+            .unwrap_or(0);
+
+        client.fulfill_oracle_data(
+            &oracle_band,
+            &second_request_id,
+            &Bytes::from_slice(&env, b"band-data"),
+        );
+
+        let second_response: OracleDataResponse = env
+            .storage()
+            .persistent()
+            .get(&DataKey::OracleResponses(second_request_id))
+            .expect("Oracle response not found");
+        assert_eq!(second_response.provider, OracleProvider::Band);
+    }
+
+    #[test]
+    fn test_insurance_policy_lifecycle() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let id = env.register_contract(None, InsuranceContract);
+        let client = InsuranceContractClient::new(&env, &id);
+
+        let policy_id = client.create_policy(&42, &50, &1000);
+        let policy = client.get_policy(&policy_id).unwrap();
+        assert_eq!(policy.premium_paid, 50);
+        assert_eq!(policy.coverage_amount, 1000);
+        assert_eq!(policy.status, ClaimStatus::Active);
+
+        client.submit_claim(&policy_id, &Bytes::from_slice(&env, b"Contract failure"));
+        let submitted = client.get_policy(&policy_id).unwrap();
+        assert_eq!(submitted.status, ClaimStatus::Submitted);
+        assert_eq!(submitted.failure_reason, Bytes::from_slice(&env, b"Contract failure"));
+
+        client.settle_claim(&policy_id);
+        let settled = client.get_policy(&policy_id).unwrap();
+        assert_eq!(settled.status, ClaimStatus::Paid);
     }
 
     #[test]
@@ -5718,4 +6161,4 @@ mod proptest;
 mod test_combinations;
 
 #[cfg(test)]
-mod test_events;
+mod test_access_control;
