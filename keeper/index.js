@@ -20,11 +20,7 @@ const { FailurePredictor, KeeperReputationScorer } = require("./src/insights");
 const { normalizeShardConfig, filterTasksForShard } = require("./src/sharding");
 const { PostgresShardManager } = require("./src/postgresShardManager");
 const { StartupValidator } = require("./src/validator");
-const { GracefulShutdownManager } = require("./src/gracefulShutdown");
-const { createDefaultFilterChain } = require("./src/taskFilter");
-const { WebhookAuthProtocol, InMemoryReplayStore } = require("./src/webhookAuth");
-const { WebhookTriggerHandler } = require("./src/webhookTrigger");
-const { SLAMonitor } = require("./src/slaMonitor");
+const { TaskReconciler } = require("./src/reconciler");
 
 // Create root logger for the main module
 const logger = createLogger("keeper");
@@ -423,127 +419,54 @@ async function main() {
   });
   await registry.init();
 
-  const p2pNetwork = new KeeperP2PNetwork({
-    ...config.p2p,
-    nodeId: config.p2p.nodeId || keypair.publicKey(),
-    logger: createLogger("p2p"),
-    loadProvider: () => {
-      const queueStatus = queue.getInFlightStatus();
-      return {
-        capacity: queue.concurrencyLimit,
-        inFlight: queueStatus.inFlight,
-        queueDepth: queueStatus.depth,
-        taskCount: registry.getTaskIds().length,
-        paused: controlState.paused,
-        dryRun: DRY_RUN,
-      };
-    },
-  });
-  metricsServer.setP2PStateProvider(() => p2pNetwork.getStateSnapshot());
+  // Initialize reconciler — detects and repairs drift between local registry
+  // and on-chain truth. Runs on startup and then on a configurable interval.
+  const reconciler = new TaskReconciler(
+    { poller, registry },
+    { logger: createLogger("reconciler") },
+  );
+
+  // Startup reconciliation: repair any drift accumulated while the keeper was
+  // offline (missed events, another keeper executing tasks, etc.).
+  logger.info("Running startup reconciliation");
   try {
-    await p2pNetwork.start();
-  } catch (error) {
-    logger.error("P2P network failed to start; falling back to local shard ownership", {
-      error: error.message,
+    const startupReport = await reconciler.reconcile();
+    logger.info("Startup reconciliation complete", {
+      checked: startupReport.checked,
+      drifted: startupReport.drifted,
+      repaired: startupReport.repaired,
+      errors: startupReport.errors,
     });
+  } catch (err) {
+    logger.warn("Startup reconciliation failed — continuing", { error: err.message });
   }
 
-  // Initialize graceful shutdown manager
-  const shutdownManager = new GracefulShutdownManager({
-    logger: createLogger("shutdown"),
-    drainTimeoutMs: parseInt(
-      process.env.SHUTDOWN_DRAIN_TIMEOUT_MS || 30000,
-      10
-    ),
-    forceTimeoutMs: parseInt(
-      process.env.SHUTDOWN_FORCE_TIMEOUT_MS || 60000,
-      10
-    ),
-  });
+  // Periodic reconciliation: catch slow drift between polling cycles.
+  // Default: every 5 minutes. Override via RECONCILE_INTERVAL_MS env var.
+  const reconcileIntervalMs = parseInt(
+    process.env.RECONCILE_INTERVAL_MS || String(5 * 60 * 1000),
+    10,
+  );
+  logger.info("Scheduling periodic reconciliation", { intervalMs: reconcileIntervalMs });
 
-  // Register polling interval for cleanup
-  shutdownManager.registerResource("polling-interval", async () => {
-    logger.info("Clearing polling interval");
-    clearInterval(pollingInterval);
-  });
-
-  // Register queue for graceful draining
-  shutdownManager.registerResource("execution-queue", async () => {
-    logger.info("Starting queue graceful shutdown");
-    const result = await queue.gracefulShutdown({
-      drainTimeoutMs: parseInt(
-        process.env.SHUTDOWN_DRAIN_TIMEOUT_MS || 30000,
-        10
-      ),
-      onProgress: (progress) => {
-        logger.debug("Queue shutdown progress", progress);
-      },
-    });
-
-    logger.info("Queue shutdown complete", result);
-
-    // Report final queue status
-    const status = queue.getInFlightStatus();
-    if (status.inFlight > 0) {
-      logger.warn("Queue shutdown: Still in-flight tasks remaining", {
-        ...status,
-      });
+  const reconcileInterval = setInterval(async () => {
+    try {
+      logger.info("Starting periodic reconciliation");
+      const report = await reconciler.reconcile();
+      if (report.drifted > 0) {
+        logger.warn("Periodic reconciliation found and repaired drift", {
+          drifted: report.drifted,
+          repaired: report.repaired,
+        });
+      }
+    } catch (err) {
+      // RECONCILIATION_IN_PROGRESS is expected if the interval fires while a
+      // previous pass (e.g. from a POST /reconcile request) is still running.
+      if (err.code !== "RECONCILIATION_IN_PROGRESS") {
+        logger.error("Periodic reconciliation error", { error: err.message });
+      }
     }
-  });
-
-  // Register SLA monitor cleanup
-  shutdownManager.registerResource("sla-monitor", async () => {
-    logger.info("Stopping SLA monitor");
-    await slaMonitor.stop();
-  });
-
-  // Register registry cleanup
-  shutdownManager.registerResource("task-registry", async () => {
-    logger.info("Closing task registry");
-    if (registry.close) {
-      await registry.close();
-    }
-  });
-
-  shutdownManager.registerResource("p2p-network", async () => {
-    logger.info("Stopping P2P network");
-    await p2pNetwork.stop();
-  });
-
-  // Register server cleanup
-  shutdownManager.registerResource("rpc-server", async () => {
-    logger.info("Closing RPC server connection");
-    // Server doesn't have explicit close, but we log it
-  });
-
-  // Register idempotency guard persistence
-  shutdownManager.registerResource("idempotency-guard", async () => {
-    logger.info("Finalizing idempotency state");
-    const snapshot = idempotencyGuard.getSnapshot();
-    logger.info("Idempotency state at shutdown", {
-      stateFile: snapshot.stateFile,
-      lockCount: snapshot.lockCount,
-      completedCount: snapshot.completedCount,
-    });
-  });
-
-  // Initialize and start listening for signals
-  shutdownManager.init();
-
-  // Listen to shutdown events for additional logging
-  shutdownManager.on("shutdown:initiated", ({ signal, reason }) => {
-    logger.warn("Shutdown initiated", { signal, reason });
-  });
-
-  shutdownManager.on("shutdown:stop-accepting", () => {
-    logger.info("Stopped accepting new work");
-    // Stop the polling loop explicitly
-    clearInterval(pollingInterval);
-  });
-
-  shutdownManager.on("shutdown:force", () => {
-    logger.warn("Force shutdown initiated - remaining tasks will be cancelled");
-  });
+  }, reconcileIntervalMs);
 
   const selectTaskOwnership = (taskIds) => {
     if (p2pNetwork.isHealthy()) {
@@ -662,27 +585,7 @@ async function main() {
       shutdownTimeoutMs,
     });
     clearInterval(pollingInterval);
-
-    const gracefulShutdown = async () => {
-      await queue.shutdown();
-    };
-
-    try {
-      await Promise.race([
-        gracefulShutdown(),
-        new Promise((_, reject) =>
-          setTimeout(() => reject(new Error('Shutdown timeout exceeded')), shutdownTimeoutMs),
-        ),
-      ]);
-      logger.info('Graceful shutdown complete, exiting', { signal });
-      process.exit(0);
-    } catch (error) {
-      logger.error('Graceful shutdown failed or timed out', {
-        signal,
-        error: error.message,
-      });
-      process.exit(1);
-    }
+    clearInterval(reconcileInterval);
     await queue.drain();
     metricsServer.stop();
     logger.info("Graceful shutdown complete, exiting");

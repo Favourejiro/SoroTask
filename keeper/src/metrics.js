@@ -338,12 +338,8 @@ class MetricsServer {
     this.registry = registry;
   }
 
-  setControlStateProvider(provider) {
-    this.controlStateProvider = provider;
-  }
-
-  setControlActionHandler(handler) {
-    this.controlActionHandler = handler;
+  setReconciler(reconciler) {
+    this.reconciler = reconciler;
   }
 
   setWebhookHandler(handler, path = this.webhookPath) {
@@ -690,7 +686,7 @@ class MetricsServer {
 
       res.setHeader('Access-Control-Allow-Origin', '*');
       res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-      res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
       if (req.method === 'OPTIONS') {
         res.writeHead(204);
@@ -730,51 +726,12 @@ class MetricsServer {
 
       } else if (req.url === '/metrics/forecast' || req.url === '/metrics/forecast/') {
         this.handleForecast(res);
-
-      } else if (req.url === '/metrics/failure-risk' || req.url === '/metrics/failure-risk/') {
-        this.handleFailureRisk(res);
-
-      } else if (req.url === '/metrics/reputation' || req.url === '/metrics/reputation/') {
-        this.handleReputation(res);
-
-      } else if (req.url === '/metrics/slo' || req.url === '/metrics/slo/') {
-        this.handleSloMetrics(res);
-
-      } else if (url.pathname === '/metrics/history' || url.pathname === '/metrics/history/') {
-        this.handleMetricsHistory(req, res);
-
-      } else if (req.url === '/admin/billing' || req.url === '/admin/billing/') {
-        protect(() => this.handleBilling(res))();
-
-
-        // 🔐 PROTECTED ROUTES START HERE
-
-      } else if (req.url === '/admin/reset' && req.method === 'POST') {
-        protect(() => {
-          this.metrics.reset();
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ success: true }));
-        })();
-
-      } else if (req.url === '/admin/dead-letter') {
-        protect(() => this.handleDeadLetter(res))();
-
-      } else if (req.url.startsWith('/admin/dead-letter/')) {
-        protect(() => this.handleDeadLetterTask(req, res))();
-
-      } else if (url.pathname === this.webhookPath && this.webhookHandler) {
-        // Webhook requests (unauthenticated - auth handled by webhook handler)
-        this.webhookHandler.handle(req, res);
-
-        // ❌ NOT FOUND
-      } else if (url.pathname === '/drift' || url.pathname === '/drift/') {
-        this.handleDrift(res);
-      } else if (url.pathname === '/admin/keeper' || url.pathname === '/admin/keeper/') {
-        this.handleAdminState(req, res);
-      } else if (url.pathname === '/admin/keeper/pause' || url.pathname === '/admin/keeper/pause/') {
-        await this.handlePauseResume(req, res, true);
-      } else if (url.pathname === '/admin/keeper/resume' || url.pathname === '/admin/keeper/resume/') {
-        await this.handlePauseResume(req, res, false);
+      } else if (req.url === '/reconcile' || req.url === '/reconcile/') {
+        if (req.method === 'POST') {
+          this.handleReconcileTrigger(res);
+        } else {
+          this.handleReconcileStatus(res);
+        }
       } else {
         res.writeHead(404);
         res.end('Not Found');
@@ -1023,6 +980,50 @@ class MetricsServer {
           resolve({});
         }
       });
+    });
+  }
+
+  /**
+   * GET /reconcile — return the most recent reconciliation report, or a
+   * 204 No Content when no reconciliation has run yet.
+   */
+  handleReconcileStatus(res) {
+    if (!this.reconciler) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Reconciler not initialised' }));
+      return;
+    }
+
+    const report = this.reconciler.getLastReport();
+    if (!report) {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(report, null, 2));
+  }
+
+  /**
+   * POST /reconcile — trigger an immediate reconciliation pass.
+   * Returns 409 Conflict when one is already running.
+   * Returns 200 with the report on success.
+   */
+  handleReconcileTrigger(res) {
+    if (!this.reconciler) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Reconciler not initialised' }));
+      return;
+    }
+
+    this.reconciler.reconcile().then((report) => {
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(report, null, 2));
+    }).catch((err) => {
+      const status = err.code === 'RECONCILIATION_IN_PROGRESS' ? 409 : 500;
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message, code: err.code ?? null }));
     });
   }
 
