@@ -19,10 +19,25 @@ const DEFAULT_CONFIG = {
 };
 
 class RetryScheduler {
-  constructor(config = {}) {
+  constructor(config = {}, budgetTracker = null) {
     this.config = { ...DEFAULT_CONFIG, ...config };
     this.retryQueue = new Map(); // taskId -> retry metadata
     this.initialized = false;
+    this.budgetTracker = budgetTracker;
+  }
+
+  setBudgetTracker(budgetTracker) {
+    this.budgetTracker = budgetTracker;
+  }
+
+  /**
+   * Attach an SloMetrics instance for retry delay instrumentation.
+   * Call this after construction when SloMetrics is available.
+   *
+   * @param {import('./sloMetrics')} sloMetrics
+   */
+  setSloMetrics(sloMetrics) {
+    this.sloMetrics = sloMetrics;
   }
 
   /**
@@ -145,6 +160,18 @@ class RetryScheduler {
       };
     }
 
+    // Check retry budget
+    if (this.budgetTracker) {
+      const budgetCheck = this.budgetTracker.canRetry(taskId);
+      if (!budgetCheck.allowed) {
+        return {
+          scheduled: false,
+          reason: `Budget: ${budgetCheck.reason}`,
+          budgetPressure: budgetCheck,
+        };
+      }
+    }
+
     // Calculate next attempt time with exponential backoff
     const delayMs = calculateDelay(currentAttempt, this.config.baseDelayMs, this.config.maxDelayMs);
     const nextAttemptTime = Date.now() + delayMs;
@@ -172,6 +199,19 @@ class RetryScheduler {
 
     // Add to queue
     this.retryQueue.set(taskId, retryMetadata);
+
+    // Record budget consumption
+    if (this.budgetTracker) {
+      this.budgetTracker.recordRetry(taskId);
+    }
+
+    // Record retry delay SLO metric
+    if (this.sloMetrics) {
+      this.sloMetrics.recordRetryDelay({
+        delayMs,
+        attempt: retryMetadata.currentAttempt,
+      });
+    }
 
     // Persist to disk
     await this.persistRetries();

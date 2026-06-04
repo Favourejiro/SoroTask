@@ -1,6 +1,28 @@
 const { Contract, xdr, TransactionBuilder, BASE_FEE, Networks, scValToNative } = require('@stellar/stellar-sdk');
 const { createRateLimiter } = require('./concurrency');
 const { createLogger } = require('./logger');
+const { validateTaskPayload } = require('../../taskValidator');
+const { TaskFilterChain } = require('./taskFilter');
+const { SimulationCache } = require('./simulationCache');
+const { ReadBatcher } = require('./readBatcher');
+const crypto = require('crypto');
+
+function normalizeLogger(logger) {
+  const base = logger || createLogger('poller');
+  const normalized = { ...base };
+
+  for (const level of ['trace', 'debug', 'info', 'warn', 'error', 'fatal']) {
+    normalized[level] = typeof base[level] === 'function'
+      ? base[level].bind(base)
+      : () => {};
+  }
+
+  normalized.childWithTrace = typeof base.childWithTrace === 'function'
+    ? (correlationId) => normalizeLogger(base.childWithTrace(correlationId))
+    : () => normalized;
+
+  return normalized;
+}
 
 /**
  * Production-grade polling engine for SoroTask Keeper.
@@ -13,8 +35,29 @@ class TaskPoller {
     this.contractId = contractId;
 
     // Structured logger for poller module
-    this.logger = options.logger || createLogger('poller');
+    this.logger = normalizeLogger(options.logger);
+
+    // Optional pre-filter chain — eliminates non-actionable tasks before RPC calls
+    this.filterChain = options.filterChain instanceof TaskFilterChain
+      ? options.filterChain
+      : null;
     this.metricsServer = options.metricsServer;
+    // SLO metrics — accept direct injection (tests) or pull from metricsServer
+    this.sloMetrics = options.sloMetrics
+      || (options.metricsServer && options.metricsServer.sloMetrics)
+      || null;
+    this.historyManager = options.historyManager || null;
+    this.resolverRuntime = options.resolverRuntime || null;
+    this.resolverFailureMode = options.resolverFailureMode || process.env.RESOLVER_FAILURE_MODE || 'skip';
+    this.shardLabel = options.shardLabel || null;
+    this.driftWarningSeconds = parseInt(
+      options.driftWarningSeconds || process.env.DRIFT_WARNING_SECONDS || 60,
+      10,
+    );
+    this.driftCriticalSeconds = parseInt(
+      options.driftCriticalSeconds || process.env.DRIFT_CRITICAL_SECONDS || 300,
+      10,
+    );
 
     // Configuration with defaults
     this.maxConcurrentReads = parseInt(
@@ -23,6 +66,16 @@ class TaskPoller {
     );
     this.maxReadsPerSecond = parseInt(
       options.maxReadsPerSecond || process.env.MAX_READS_PER_SECOND || 20,
+      10,
+    );
+
+    // Load smoothing configuration
+    this.maxJitterSeconds = parseInt(
+      options.maxJitterSeconds !== undefined ? options.maxJitterSeconds : (process.env.MAX_TASK_JITTER_SECONDS || 0),
+      10,
+    );
+    this.unacceptableLatenessSeconds = parseInt(
+      options.unacceptableLatenessSeconds !== undefined ? options.unacceptableLatenessSeconds : (process.env.UNACCEPTABLE_LATENESS_SECONDS || 300),
       10,
     );
 
@@ -45,11 +98,15 @@ class TaskPoller {
       tasksChecked: 0,
       tasksDue: 0,
       tasksSkipped: 0,
+      tasksFiltered: 0,
+      tasksSmoothed: 0,
+      unacceptablyLate: 0,
       errors: 0,
     };
 
     this.lastCycleInsights = {
       backlogSize: 0,
+      filteredCount: 0,
       dueCount: 0,
       dueSoonCount: 0,
       minSecondsUntilDue: null,
@@ -57,6 +114,39 @@ class TaskPoller {
       cycleDurationMs: 0,
       errors: 0,
     };
+
+    // Cache for simulation results to avoid redundant RPC calls
+    this.simulationCache = new SimulationCache({
+      ttlSeconds: parseInt(options.simulationCacheTtl || '30', 10),
+      maxSize: parseInt(options.simulationCacheMaxSize || '1000', 10),
+    });
+
+    // Track cache stats for metrics
+    this.statsCacheHitRate = 0;
+
+    // Optional read batcher — coalesces per-task reads into bulk getLedgerEntries
+    // calls, reducing RPC round-trips from O(n) to O(ceil(n/batchSize)).
+    // Enabled when options.batcher is provided OR when options.batchReadsEnabled
+    // is true (in which case this constructor creates one internally).
+    if (options.batcher instanceof ReadBatcher) {
+      this.batcher = options.batcher;
+    } else if (options.batchReadsEnabled || process.env.BATCH_READS_ENABLED === 'true') {
+      this.batcher = new ReadBatcher(
+        this.server,
+        this.contractId,
+        scVal => this.decodeTaskConfig(scVal),
+        {
+          batchWindowMs: parseInt(options.batchWindowMs || process.env.BATCH_WINDOW_MS || '10', 10),
+          maxBatchSize: parseInt(options.readBatchSize || process.env.READ_BATCH_SIZE || '50', 10),
+          batchConcurrency: parseInt(options.batchConcurrency || process.env.BATCH_CONCURRENCY || '2', 10),
+          batchRps: parseInt(options.batchRps || process.env.BATCH_RPS || '10', 10),
+          logger: this.logger,
+          metricsServer: this.metricsServer,
+        },
+      );
+    } else {
+      this.batcher = null;
+    }
   }
 
   /**
@@ -67,11 +157,17 @@ class TaskPoller {
      * @returns {Promise<number[]>} Array of task IDs that are due for execution
      */
   async pollDueTasks(taskIds, options = {}) {
+    const cycleId = crypto.randomBytes(4).toString('hex');
+    const cycleLogger = this.logger.childWithTrace(`cycle-${cycleId}`);
+    
     const startTime = Date.now();
     this.stats.lastPollTime = new Date().toISOString();
     this.stats.tasksChecked = 0;
     this.stats.tasksDue = 0;
     this.stats.tasksSkipped = 0;
+    this.stats.tasksFiltered = 0;
+    this.stats.tasksSmoothed = 0;
+    this.stats.unacceptablyLate = 0;
     this.stats.errors = 0;
 
     const rpcLatencies = [];
@@ -81,6 +177,7 @@ class TaskPoller {
       this.logger.info('No tasks to check');
       this.lastCycleInsights = {
         backlogSize: 0,
+        filteredCount: 0,
         dueCount: 0,
         dueSoonCount: 0,
         minSecondsUntilDue: null,
@@ -94,19 +191,80 @@ class TaskPoller {
     try {
       // Fetch current ledger timestamp
       const ledgerInfo = await this.server.getLatestLedger();
-      const currentTimestamp = ledgerInfo.sequence; // Using sequence as timestamp proxy
+      const currentTimestamp = this.resolveLedgerTimestamp(ledgerInfo);
 
       // Note: In production, you'd want to use the actual ledger timestamp
       // which might require additional RPC calls or using ledger.timestamp from contract context
-      this.logger.info('Current ledger sequence', { sequence: currentTimestamp });
+      cycleLogger.info('Current ledger sequence', { sequence: currentTimestamp });
 
-      // Process tasks in parallel with concurrency control
-      const taskChecks = taskIds.map(taskId =>
+      // ── Pre-filter: eliminate non-actionable tasks without any RPC calls ──
+      let candidateIds = taskIds;
+      let filteredCount = 0;
+
+      if (this.filterChain) {
+        const registry = (options && options.registry) || null;
+        const { eligible, stats: filterStats } = this.filterChain.filterTaskIds(taskIds, {
+          currentTimestamp,
+          registry,
+          idempotencyGuard: options && options.idempotencyGuard,
+          circuitBreaker: options && options.circuitBreaker,
+        });
+
+        filteredCount = filterStats.totalFiltered;
+        this.stats.tasksFiltered = filteredCount;
+        candidateIds = eligible;
+
+        if (filteredCount > 0) {
+          this.logger.info('Pre-filter eliminated tasks', {
+            total: taskIds.length,
+            filtered: filteredCount,
+            eligible: eligible.length,
+            byFilter: filterStats.filterRejections,
+          });
+        }
+      }
+
+      // Process only candidate tasks in parallel with concurrency control.
+      // Pass registry so checkTask can hydrate the cache (gas_balance, last_run, interval)
+      // which enables cachedGasFilter and cachedTimingFilter to fire on subsequent cycles.
+      const registry = (options && options.registry) || null;
+
+      // ── Batched read path ───────────────────────────────────────────────────
+      // When a ReadBatcher is configured, pre-fetch all candidate configs in
+      // ceil(n/batchSize) getLedgerEntries calls instead of n simulateTransaction
+      // calls.  The pre-loaded config is passed into checkTask to skip the per-task
+      // RPC call.  Tasks missing from the batch response (null) are still passed
+      // through — checkTask treats them as "not found" and returns isDue:false.
+      let preloadedConfigs = null;
+      if (this.batcher && candidateIds.length > 0) {
+        try {
+          preloadedConfigs = await this.batcher.readMany(candidateIds);
+          cycleLogger.debug('Batch pre-fetch complete', {
+            requested: candidateIds.length,
+            resolved: preloadedConfigs.size,
+          });
+        } catch (batchErr) {
+          // Non-fatal: fall back to per-task simulation reads for this cycle
+          this.logger.warn('Batch pre-fetch failed — falling back to per-task reads', {
+            error: batchErr.message || String(batchErr),
+          });
+          preloadedConfigs = null;
+        }
+      }
+
+      const taskChecks = candidateIds.map(taskId =>
         this.readLimit(async () => {
           const startedAt = Date.now();
-          const result = await this.checkTask(taskId, currentTimestamp);
+          const correlationId = `poll-${taskId}-${crypto.randomBytes(4).toString('hex')}`;
+          const preloaded = preloadedConfigs ? preloadedConfigs.get(Number(taskId)) : undefined;
+          const result = await this.checkTask(
+            taskId,
+            currentTimestamp,
+            registry,
+            { correlationId, preloadedConfig: preloaded },
+          );
           rpcLatencies.push(Date.now() - startedAt);
-          return result;
+          return { ...result, correlationId };
         }),
       );
 
@@ -114,20 +272,45 @@ class TaskPoller {
 
       // Collect due task IDs from successful checks
       const dueTaskIds = [];
+      const includeContext = options.includeContext === true;
+      let warningDriftCount = 0;
+      let criticalDriftCount = 0;
+      let maxDriftSeconds = 0;
+      let maxDriftTaskId = null;
 
       results.forEach((result, index) => {
-        if (result.status === 'fulfilled' && result.value) {
-          const { isDue, taskId, reason } = result.value;
+        if (result.status === 'fulfilled') {
+          const { isDue, taskId, reason, correlationId } = result.value;
 
           if (isDue) {
-            dueTaskIds.push(taskId);
+            dueTaskIds.push(
+              includeContext
+                ? this.formatDueTask(result.value)
+                : taskId,
+            );
             this.stats.tasksDue++;
+            if (result.value.isUnacceptablyLate) {
+              this.stats.unacceptablyLate++;
+            }
           } else if (reason === 'skipped') {
             this.stats.tasksSkipped++;
+          } else if (reason === 'jitter_smoothed') {
+            this.stats.tasksSmoothed++;
           }
 
           if (Number.isFinite(result.value.secondsUntilDue)) {
             secondsUntilDueValues.push(result.value.secondsUntilDue);
+          }
+
+          if (result.value.driftSeverity === 'warning') {
+            warningDriftCount += 1;
+          } else if (result.value.driftSeverity === 'critical') {
+            criticalDriftCount += 1;
+          }
+
+          if ((result.value.driftSeconds || 0) > maxDriftSeconds) {
+            maxDriftSeconds = result.value.driftSeconds;
+            maxDriftTaskId = result.value.taskId;
           }
 
           this.stats.tasksChecked++;
@@ -147,6 +330,7 @@ class TaskPoller {
 
       this.lastCycleInsights = {
         backlogSize: taskIds.length,
+        filteredCount: this.stats.tasksFiltered,
         dueCount: dueTaskIds.length,
         dueSoonCount,
         minSecondsUntilDue: positiveDueWindows.length > 0 ? Math.min(...positiveDueWindows) : null,
@@ -155,15 +339,85 @@ class TaskPoller {
         errors: this.stats.errors,
       };
 
-      this.logPollSummary(duration);
+      if (this.metricsServer) {
+        const retryStats = this.metricsServer.retryBudgetTracker?.getStats?.() || { global: { percentage: 0 } };
+        this.metricsServer.increment('tasksCheckedTotal', this.stats.tasksChecked);
+        this.metricsServer.updateHealth({
+          lastPollAt: new Date(),
+          rpcConnected: true,
+          backlogSize: taskIds.length,
+          retryBudgetPressure: retryStats.global?.percentage || 0,
+        });
+        this.metricsServer.updateDriftState({
+          warning: warningDriftCount,
+          critical: criticalDriftCount,
+          maxDriftSeconds,
+          taskId: maxDriftTaskId,
+          severity: criticalDriftCount > 0 ? 'critical' : (warningDriftCount > 0 ? 'warning' : 'none'),
+          observedAt: new Date().toISOString(),
+        });
+      }
+
+      // ── SLO instrumentation ──────────────────────────────────────────────
+      if (this.sloMetrics) {
+        // Record per-task lateness for every due task detected this cycle
+        results.forEach(result => {
+          if (result.status === 'fulfilled' && result.value.isDue) {
+            this.sloMetrics.recordTaskLateness({
+              lateness: result.value.lateness,
+              driftSeverity: result.value.driftSeverity,
+              isUnacceptablyLate: result.value.isUnacceptablyLate,
+            });
+          }
+        });
+
+        this.sloMetrics.recordPollCycle({
+          success: true,
+          durationMs: duration,
+          taskCount: taskIds.length,
+          dueCount: dueTaskIds.length,
+        });
+      }
+
+      this.logPollSummary(duration, cycleLogger);
 
       return dueTaskIds;
 
     } catch (error) {
       this.logger.error('Fatal error during polling cycle', { error: error.message, stack: error.stack });
       this.stats.errors++;
+      if (this.metricsServer) {
+        this.metricsServer.updateHealth({
+          lastPollAt: new Date(),
+          rpcConnected: false,
+        });
+      }
+      if (this.sloMetrics) {
+        this.sloMetrics.recordPollCycle({
+          success: false,
+          durationMs: Date.now() - startTime,
+          taskCount: taskIds.length,
+          dueCount: 0,
+        });
+      }
       return [];
     }
+  }
+
+  formatDueTask(result) {
+    const context = {
+      pollCorrelationId: result.correlationId,
+    };
+
+    if (result.resolver) {
+      context.resolver = result.resolver;
+    }
+
+    return {
+      taskId: result.taskId,
+      correlationId: result.correlationId,
+      context,
+    };
   }
 
   /**
@@ -171,16 +425,43 @@ class TaskPoller {
      *
      * @param {number} taskId - The task ID to check
      * @param {number} currentTimestamp - Current ledger timestamp
-     * @returns {Promise<{isDue: boolean, taskId: number, reason?: string}>}
+     * @param {Object} [registry] - Optional task registry
+     * @param {Object} [options] - Additional options including correlationId
+     * @returns {Promise<{isDue: boolean, taskId: number, reason?: string, correlationId?: string}>}
      */
-  async checkTask(taskId, currentTimestamp, registry) {
+  async checkTask(taskId, currentTimestamp, registry, options = {}) {
+    const correlationId = options.correlationId;
+    const taskLogger = correlationId 
+      ? this.logger.childWithTrace(correlationId)
+      : this.logger;
+
     try {
-      // Read task configuration from contract using view call
-      const taskConfig = await this.getTaskConfig(taskId);
+      // Check cache first for task configuration
+      const cachedConfig = this.simulationCache.get(taskId);
+      let taskConfig;
+
+      if (cachedConfig) {
+        taskConfig = cachedConfig;
+      } else if (options.preloadedConfig !== undefined) {
+        // Use config pre-fetched by ReadBatcher — no extra RPC call needed.
+        // preloadedConfig is null when the task was not found in the batch response.
+        taskConfig = options.preloadedConfig || null;
+        if (taskConfig) {
+          this.simulationCache.set(taskId, taskConfig);
+        }
+      } else {
+        // Read task configuration from contract using view call (per-task fallback)
+        taskConfig = await this.getTaskConfig(taskId);
+
+        // Cache the result for future polls
+        if (taskConfig) {
+          this.simulationCache.set(taskId, taskConfig);
+        }
+      }
 
       if (!taskConfig) {
-        this.logger.warn('Task not found (may have been deregistered)', { taskId });
-        return { isDue: false, taskId, reason: 'not_found' };
+        taskLogger.warn('Task not found (may have been deregistered)', { taskId });
+        return { isDue: false, taskId, reason: 'not_found', correlationId };
       }
 
       // Update registry with latest task details
@@ -188,37 +469,231 @@ class TaskPoller {
         registry.updateTask(taskId, { ...taskConfig, status: taskConfig.gas_balance > 0 ? 'active' : 'low_gas' });
       }
 
+      // Validate task payload size and shape
+      const validation = validateTaskPayload(taskConfig, taskConfig.args || []);
+      if (!validation.isValid) {
+        this.logger.error('Task rejected due to malformed payload', { taskId, errors: validation.errors.join(', ') });
+        return { isDue: false, taskId, reason: 'invalid_payload' };
+      }
+
       // Check gas balance
       if (taskConfig.gas_balance <= 0) {
-        this.logger.warn('Task has insufficient gas balance', { taskId, gasBalance: taskConfig.gas_balance });
-        return { isDue: false, taskId, reason: 'skipped' };
+        taskLogger.warn('Task has insufficient gas balance', { taskId, gasBalance: taskConfig.gas_balance });
+        return { isDue: false, taskId, reason: 'skipped', correlationId };
       }
 
       // Calculate if task is due: last_run + interval <= currentTimestamp
       const nextRunTime = taskConfig.last_run + taskConfig.interval;
-      const isDue = nextRunTime <= currentTimestamp;
+      let jitter = 0;
+      if (this.maxJitterSeconds > 0) {
+        jitter = (Number(taskId) * 2654435761) % (this.maxJitterSeconds + 1);
+      }
+
+      const effectiveNextRunTime = nextRunTime + jitter;
+      let isDue = effectiveNextRunTime <= currentTimestamp;
+      const isStrictlyDue = nextRunTime <= currentTimestamp;
+
+      let reason = null;
+      let lateness = 0;
+      let isUnacceptablyLate = false;
+
+      const driftSeconds = Number.isFinite(nextRunTime)
+        ? Math.max(0, currentTimestamp - nextRunTime)
+        : 0;
+      const driftSeverity = this.getDriftSeverity(driftSeconds);
 
       if (isDue) {
-        this.logger.info('Task is due', {
+        lateness = currentTimestamp - effectiveNextRunTime;
+        isUnacceptablyLate = lateness > this.unacceptableLatenessSeconds;
+
+        if (isUnacceptablyLate) {
+          this.logger.warn('Task is unacceptably late', {
+            taskId,
+            latenessSeconds: lateness,
+            nextRunTime,
+            effectiveNextRunTime,
+            currentTimestamp,
+            interval: taskConfig.interval,
+          });
+        }
+
+        taskLogger.info('Task is due', {
           taskId,
           lastRun: taskConfig.last_run,
           interval: taskConfig.interval,
           nextRun: nextRunTime,
+          jitterApplied: jitter,
+          effectiveNextRun: effectiveNextRunTime,
           current: currentTimestamp,
+          latenessSeconds: lateness,
+          driftSeconds,
+          driftSeverity,
         });
+      } else if (isStrictlyDue) {
+        reason = 'jitter_smoothed';
+        this.logger.debug('Task execution smoothed by jitter', {
+          taskId,
+          nextRunTime,
+          effectiveNextRunTime,
+          currentTimestamp,
+          jitterSeconds: jitter,
+          driftSeconds,
+          driftSeverity,
+        });
+      }
+
+      if (driftSeverity !== 'none' && this.historyManager) {
+        this.historyManager.recordDrift({
+          taskId,
+          expectedRunAt: nextRunTime,
+          observedAt: currentTimestamp,
+          driftSeconds,
+          severity: driftSeverity,
+          shardLabel: this.shardLabel,
+        });
+      }
+
+      if (registry) {
+        registry.updateTask(taskId, {
+          nextRunAt: nextRunTime,
+          observedAt: currentTimestamp,
+          driftSeconds,
+          driftSeverity,
+          scheduleStatus: isDue ? 'due' : 'waiting',
+        });
+      }
+
+      let resolver = null;
+      if (isDue) {
+        resolver = await this.evaluateResolverGate(taskId, taskConfig, currentTimestamp, { correlationId, taskLogger });
+        if (resolver && !resolver.isReady) {
+          isDue = false;
+          reason = resolver.reason === 'error'
+            ? 'resolver_error'
+            : 'resolver_not_ready';
+
+          if (registry) {
+            registry.updateTask(taskId, {
+              scheduleStatus: 'resolver_blocked',
+              resolverId: resolver.resolverId,
+              resolverReason: resolver.reason || null,
+            });
+          }
+        }
       }
 
       return {
         isDue,
         taskId,
-        secondsUntilDue: Number.isFinite(nextRunTime)
-          ? Math.max(0, nextRunTime - currentTimestamp)
+        reason,
+        lateness: isDue ? lateness : 0,
+        isUnacceptablyLate,
+        correlationId,
+        secondsUntilDue: Number.isFinite(effectiveNextRunTime)
+          ? Math.max(0, effectiveNextRunTime - currentTimestamp)
           : null,
+        driftSeconds,
+        driftSeverity,
+        resolver,
       };
 
     } catch (error) {
-      this.logger.error('Error checking task', { taskId, error: error.message });
+      taskLogger.error('Error checking task', { taskId, error: error.message });
       throw error;
+    }
+  }
+
+  getResolverId(taskConfig) {
+    const resolver = taskConfig && taskConfig.resolver;
+    if (!resolver) {
+      return null;
+    }
+
+    if (typeof resolver === 'string') {
+      return resolver.trim() || null;
+    }
+
+    if (typeof resolver === 'object') {
+      return resolver.id || resolver.name || resolver.resolver || null;
+    }
+
+    return null;
+  }
+
+  async evaluateResolverGate(taskId, taskConfig, currentTimestamp, options = {}) {
+    const resolverId = this.getResolverId(taskConfig);
+    if (!resolverId) {
+      return null;
+    }
+
+    const taskLogger = options.taskLogger || this.logger;
+
+    if (!this.resolverRuntime) {
+      taskLogger.warn('Task declares resolver but no resolver runtime is configured', {
+        taskId,
+        resolverId,
+      });
+      return null;
+    }
+
+    try {
+      const result = await this.resolverRuntime.evaluate(resolverId, {
+        taskId,
+        currentTimestamp,
+        taskConfig,
+      }, {
+        correlationId: options.correlationId,
+      });
+
+      if (!result.isReady) {
+        taskLogger.info('Resolver skipped task execution', {
+          taskId,
+          resolverId,
+          reason: result.reason || null,
+          durationMs: result.durationMs,
+        });
+      } else {
+        taskLogger.info('Resolver accepted task execution', {
+          taskId,
+          resolverId,
+          durationMs: result.durationMs,
+        });
+      }
+
+      return {
+        resolverId,
+        isReady: result.isReady,
+        reason: result.reason || null,
+        args: result.args || [],
+        metadata: result.metadata || null,
+        runtime: result.runtime,
+        durationMs: result.durationMs,
+      };
+    } catch (error) {
+      taskLogger.error('Resolver execution failed', {
+        taskId,
+        resolverId,
+        code: error.code || 'UNKNOWN',
+        error: error.message,
+      });
+
+      if (this.resolverFailureMode === 'allow') {
+        return {
+          resolverId,
+          isReady: true,
+          reason: 'fallback_allow',
+          error: error.message,
+          code: error.code || 'UNKNOWN',
+        };
+      }
+
+      return {
+        resolverId,
+        isReady: false,
+        reason: 'error',
+        error: error.message,
+        code: error.code || 'UNKNOWN',
+      };
     }
   }
 
@@ -359,15 +834,82 @@ class TaskPoller {
    * Log a summary of the polling cycle.
    *
    * @param {number} duration - Duration of the poll in milliseconds
+   * @param {Object} [customLogger] - Optional logger to use
    */
-  logPollSummary(duration) {
-    this.logger.info('Poll complete', {
+  logPollSummary(duration, customLogger) {
+    const l = customLogger || this.logger;
+    const batcherStats = this.batcher ? this.batcher.getStats() : null;
+    l.info('Poll complete', {
       durationMs: duration,
+      backlog: this.stats.tasksChecked + this.stats.tasksFiltered,
+      preFiltered: this.stats.tasksFiltered,
       checked: this.stats.tasksChecked,
       due: this.stats.tasksDue,
+      smoothed: this.stats.tasksSmoothed,
+      late: this.stats.unacceptablyLate,
       skipped: this.stats.tasksSkipped,
       errors: this.stats.errors,
+      ...(batcherStats && {
+        batcher: {
+          batches: batcherStats.totalBatches,
+          savedRpcCalls: batcherStats.savedRpcCalls,
+          avgBatchSize: batcherStats.avgBatchSize,
+          avgLatencyMs: batcherStats.avgBatchLatencyMs,
+          errors: batcherStats.batchErrors,
+        },
+      }),
     });
+  }
+
+  /**
+   * Get read batcher performance statistics.
+   * Returns null when batching is not enabled.
+   *
+   * @returns {Object|null}
+   */
+  getBatcherStats() {
+    return this.batcher ? this.batcher.getStats() : null;
+  }
+
+  resolveLedgerTimestamp(ledgerInfo = {}) {
+    const candidates = [
+      ledgerInfo.closeTime,
+      ledgerInfo.closedAt,
+      ledgerInfo.closed_at,
+      ledgerInfo.ledgerCloseTime,
+      ledgerInfo.timestamp,
+    ];
+
+    for (const candidate of candidates) {
+      if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+        return candidate;
+      }
+      if (typeof candidate === 'string' && candidate) {
+        const parsedNumber = Number(candidate);
+        if (Number.isFinite(parsedNumber)) {
+          return parsedNumber;
+        }
+        const parsedDate = Date.parse(candidate);
+        if (Number.isFinite(parsedDate)) {
+          return Math.floor(parsedDate / 1000);
+        }
+      }
+    }
+
+    return Number(ledgerInfo.sequence || 0);
+  }
+
+  getDriftSeverity(driftSeconds) {
+    if (!Number.isFinite(driftSeconds) || driftSeconds <= 0) {
+      return 'none';
+    }
+    if (driftSeconds >= this.driftCriticalSeconds) {
+      return 'critical';
+    }
+    if (driftSeconds >= this.driftWarningSeconds) {
+      return 'warning';
+    }
+    return 'none';
   }
 
   /**
@@ -414,6 +956,42 @@ class TaskPoller {
 
   getCycleInsights() {
     return { ...this.lastCycleInsights };
+  }
+
+  /**
+   * Invalidate cached simulation data for one or more tasks.
+   * Call this after a task is executed to ensure fresh data on next poll.
+   *
+   * @param {number|number[]} taskIds - Task ID(s) to invalidate
+   * @returns {number} Number of entries invalidated
+   */
+  invalidateCache(taskIds) {
+    const ids = Array.isArray(taskIds) ? taskIds : [taskIds];
+    return this.simulationCache.invalidateAll(ids);
+  }
+
+  /**
+   * Get simulation cache statistics.
+   *
+   * @returns {Object} Cache stats including hit rate
+   */
+  getCacheStats() {
+    return this.simulationCache.getStats();
+  }
+
+  /**
+   * Enable or disable simulation caching.
+   * Useful for debugging or specific scenarios.
+   *
+   * @param {boolean} enabled
+   */
+  setCacheEnabled(enabled) {
+    if (!enabled) {
+      this.simulationCache.clear();
+      this.logger.info('Simulation cache disabled and cleared');
+    } else {
+      this.logger.info('Simulation cache enabled');
+    }
   }
 }
 

@@ -1,6 +1,25 @@
 require('@testing-library/jest-dom')
 const React = require('react')
 
+if (typeof global.fetch !== 'function') {
+  global.fetch = jest.fn(() =>
+    Promise.resolve({
+      ok: true,
+      json: async () => ({
+        riskScore: 18,
+        riskLevel: 'low',
+        confidence: 'high',
+        summary: 'Low risk predicted by test fallback.',
+        evidence: {
+          gasShortfall: false,
+          intervalTooFast: false,
+          contractReputation: 'Mock fallback prediction executed.',
+        },
+      } ),
+    })
+  )
+}
+
 // Mock environment variables for tests
 process.env.NEXT_PUBLIC_API_URL = 'http://localhost:3000'
 
@@ -20,28 +39,28 @@ afterAll(() => {
 jest.mock('next/router', () => ({
   useRouter() {
     return {
-      route: '/',
-      pathname: '/',
-      query: {},
-      asPath: '/',
       push: jest.fn(),
       replace: jest.fn(),
-      reload: jest.fn(),
+      refresh: jest.fn(),
       back: jest.fn(),
       forward: jest.fn(),
       prefetch: jest.fn(),
-      beforePopState: jest.fn(),
-      events: {
-        on: jest.fn(),
-        off: jest.fn(),
-        emit: jest.fn(),
-      },
-      isFallback: false,
     }
   },
+  usePathname() {
+    return '/'
+  },
+  useSearchParams() {
+    return new URLSearchParams()
+  },
+  useParams() {
+    return {}
+  },
+  redirect: jest.fn(),
+  notFound: jest.fn(),
 }))
 
-// Mock Next.js Image component
+// Mock Next.js Image component to avoid next/image optimisation in tests.
 jest.mock('next/image', () => ({
   __esModule: true,
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
