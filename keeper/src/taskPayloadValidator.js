@@ -100,7 +100,7 @@ function validateTaskPayload(taskConfig, args = []) {
         `payload size ${sizeBytes} bytes exceeds ${LIMITS.MAX_PAYLOAD_SIZE_BYTES} bytes.`,
       );
     }
-  } catch (error) {
+  } catch (_error) {
     errors.push("payload must be JSON serializable.");
   }
 

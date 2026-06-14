@@ -17,7 +17,7 @@ class KeyManager {
       if (fs.existsSync(this.metaFile)) {
         return JSON.parse(fs.readFileSync(this.metaFile, 'utf8')) || {};
       }
-    } catch (e) {
+    } catch (_e) {
       // ignore and start fresh
     }
     return {};

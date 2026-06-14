@@ -6,7 +6,7 @@
 const {
   MESSAGE_TYPES,
   createMessage,
-  signMessage,
+  _signMessage,
   verifySignature,
   createProposalMessage,
   createVoteMessage,
@@ -147,8 +147,8 @@ describe('Consensus Messages', () => {
       const msg2 = createProposalMessage('task-1', 1, keeperId, secret);
 
       // Remove IDs and timestamps for comparison
-      const { id: id1, timestamp: ts1, signature: sig1, ...m1 } = msg1;
-      const { id: id2, timestamp: ts2, signature: sig2, ...m2 } = msg2;
+      const { id: _id1, timestamp: _ts1, signature: _sig1, ..._m1 } = msg1;
+      const { id: _id2, timestamp: _ts2, signature: _sig2, ..._m2 } = msg2;
 
       // Signatures should verify with same secret
       expect(verifySignature(msg1, secret)).toBe(true);

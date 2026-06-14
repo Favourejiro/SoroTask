@@ -13,7 +13,7 @@
  */
 
 const { createLogger } = require('./logger');
-const { withRetry, ErrorClassification } = require('./retry.js');
+const { withRetry, _ErrorClassification } = require('./retry.js');
 
 const logger = createLogger('notification-service');
 

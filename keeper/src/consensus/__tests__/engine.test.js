@@ -4,7 +4,7 @@
  */
 
 const ConsensusEngine = require('../engine');
-const { MESSAGE_TYPES, createVoteMessage } = require('../messages');
+const { _MESSAGE_TYPES, createVoteMessage } = require('../messages');
 
 describe('ConsensusEngine', () => {
   let engine;

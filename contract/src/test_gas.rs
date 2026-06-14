@@ -1,5 +1,3 @@
-#![cfg(test)]
-
 use crate::{SoroTaskContract, SoroTaskContractClient, TaskConfig};
 use soroban_sdk::{
     contract, contractimpl,

@@ -1,5 +1,5 @@
-const { EventEmitter } = require('events');
-const { WebhookTriggerHandler, readRawBody } = require('../src/webhookTrigger');
+const { _EventEmitter } = require('events');
+const { WebhookTriggerHandler, _readRawBody } = require('../src/webhookTrigger');
 const { InMemoryReplayStore } = require('../src/webhookAuth');
 const { createLogger } = require('../src/logger');
 
@@ -122,7 +122,7 @@ describe('WebhookTriggerHandler', () => {
         }
       });
 
-      const errorHandler = jest.fn();
+      const _errorHandler = jest.fn();
       mockReq.destroy = jest.fn();
       
       // Set smaller max body bytes

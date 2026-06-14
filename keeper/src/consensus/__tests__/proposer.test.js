@@ -48,15 +48,15 @@ describe('Proposer', () => {
 
   describe('Executor Assignment', () => {
     test('should assign executor deterministically', () => {
-      const p = proposer.createProposal('task-1');
+      const _p = proposer.createProposal('task-1');
       const executor1 = proposer.assignExecutor('task-1', 1, ['keeper-1', 'keeper-2', 'keeper-3']);
 
       // Proposing same task again should assign same executor
-      const p2 = proposer.createProposal('task-2');
+      const _p2 = proposer.createProposal('task-2');
       const executor2 = proposer.assignExecutor('task-2', 1, ['keeper-1', 'keeper-2', 'keeper-3']);
 
       // Same task should always get same executor
-      const executor3 = proposer.assignExecutor('task-1', 2, ['keeper-1', 'keeper-2', 'keeper-3']);
+      const _executor3 = proposer.assignExecutor('task-1', 2, ['keeper-1', 'keeper-2', 'keeper-3']);
       
       // Executors might differ for different tasks, but same task should be consistent
       expect(executor1).toBeDefined();

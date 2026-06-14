@@ -1,4 +1,4 @@
-const { xdr, nativeToScVal, Address } = require("@stellar/stellar-sdk");
+const { _xdr, nativeToScVal, Address } = require("@stellar/stellar-sdk");
 const { createLogger } = require("./logger");
 
 /**

@@ -1,12 +1,12 @@
 const http = require('http');
 const promClient = require('prom-client');
-const { Server } = require('socket.io');
+const { _Server } = require('socket.io');
 const { requireAdminAuth } = require('./auth');
 const { URL } = require('url');
 const { createLogger } = require('./logger');
 const { ApiGateway } = require('./apiGateway');
 const { FailurePredictor, KeeperReputationScorer } = require('./insights');
-const SloMetrics = require('./sloMetrics');
+const _SloMetrics = require('./sloMetrics');
 
 class MetricsHistory {
   constructor(maxSamples = 120) {
@@ -484,7 +484,6 @@ class Metrics {
     return this.sloThresholds[key] || null;
   }
 
-  updateHealth(state) {
   updateHealth(state = {}) {
     if (state.lastPollAt) {
       this.lastPollAt = state.lastPollAt instanceof Date
@@ -646,45 +645,6 @@ class Metrics {
   }
 }
 
-  reset() {
-    this.counters = {
-      tasksCheckedTotal: 0,
-      tasksDueTotal: 0,
-      tasksExecutedTotal: 0,
-      tasksFailedTotal: 0,
-      throttledRequestsTotal: 0,
-      tasksSkippedIdempotencyTotal: 0,
-      pollFreshnessSloSuccess: 0,
-      pollFreshnessSloFailure: 0,
-      executionTimelinessSloSuccess: 0,
-      executionTimelinessSloFailure: 0,
-      retriesExhausted: 0,
-      retriesExecutedTotal: 0,
-      retriesFailedTotal: 0,
-      retryAttemptsTotal: { success: 0, failure: 0, duplicate: 0 },
-    };
-    this.gauges = {
-      avgFeePaidXlm: 0,
-      lastCycleDurationMs: 0,
-      rpcCircuitState: 0,
-      pollFreshnessSeconds: 0,
-      oldestTaskAgeSeconds: 0,
-      retryQueueSize: 0,
-      pollFreshnessSloRate: 0,
-      executionTimelinessSloRate: 0,
-    };
-    this.feeSamples = [];
-    tasksExecutedTotal: 0,
-      tasksFailedTotal: 0,
-        throttledRequestsTotal: 0,
-    };
-    this.gauges = {
-  avgFeePaidXlm: 0,
-  lastCycleDurationMs: 0,
-  rpcCircuitState: 0,
-};
-this.feeSamples = [];
-  }
 function createDefaultGasMonitor() {
   return {
     getLowGasCount: () => 0,
@@ -1560,11 +1520,6 @@ class MetricsServer {
     }
   }
 
-    // Compute poll freshness dynamically based on last completion time
-    const freshnessSeconds = this.metrics.lastPollCompletedAt
-      ? Math.floor((Date.now() - this.metrics.lastPollCompletedAt.getTime()) / 1000)
-      : 0;
-    this.promPollFreshnessSeconds.set(freshnessSeconds);
   incrementBudgetExhausted(scope = 'global', reason = 'limit') {
     if (this.promBudgetExhausted) {
       this.promBudgetExhausted.inc({ scope, reason });
@@ -1749,7 +1704,7 @@ class MetricsServer {
      * @param {number} scheduledDueLedger - Ledger when task was due
      * @param {boolean} success - Whether execution succeeded
      */
-    recordTaskExecution({ taskId, actualExecutionLedger, scheduledDueLedger, success }) {
+    recordTaskExecution({ _taskId, actualExecutionLedger, scheduledDueLedger, _success }) {
       const latenessLedgers = Math.max(0, actualExecutionLedger - scheduledDueLedger);
       this.promTaskLateness.observe(latenessLedgers);
 
@@ -1823,7 +1778,6 @@ class MetricsServer {
        this.metrics.record('executionTimelinessSloRate', this.metrics.counters.executionTimelinessSloSuccess / totalExec);
      }
    }
-  }
 
   handleHealth(res) {
     const status = this.metrics.getHealthStatus(this.healthStaleThreshold);

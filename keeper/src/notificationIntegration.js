@@ -8,7 +8,7 @@
  */
 
 const { createLogger } = require('./logger');
-const { NotificationService, NotificationType, NotificationChannel, NotificationPriority } = require('./notificationService');
+const { _NotificationService, NotificationType, NotificationChannel, NotificationPriority } = require('./notificationService');
 
 const logger = createLogger('notification-integration');
 

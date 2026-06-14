@@ -23,7 +23,7 @@ async function initializeKeeperAccount() {
   let keypair;
   try {
     keypair = Keypair.fromSecret(secret);
-  } catch (err) {
+  } catch (_err) {
     throw new Error('Failed to derive keypair from KEEPER_SECRET. Ensure it is a valid Stellar secret key.');
   }
 

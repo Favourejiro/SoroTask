@@ -247,7 +247,7 @@ class ChaosRpcServer extends MockSorobanRpcServer {
       try {
         const body = JSON.parse(req.body || '{}');
         method = body.method || '';
-      } catch (e) {
+      } catch (_e) {
         return false;
       }
     }

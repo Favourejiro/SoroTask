@@ -1,5 +1,5 @@
 // Simple metrics tests
-const { Metrics, MetricsHistory } = require('../src/metrics');
+const { Metrics, _MetricsHistory } = require('../src/metrics');
 
 describe('Metrics', () => {
   let metrics;

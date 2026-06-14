@@ -2,7 +2,7 @@ let logger;
 try {
   const loggerModule = require('./logger');
   logger = loggerModule?.createLogger?.('simulation-cache') || console;
-} catch (e) {
+} catch (_e) {
   logger = {
     debug: () => {},
     info: () => {},

@@ -23,7 +23,7 @@ const logger = createLogger("executor");
  * @returns {Promise<{status: string, feePaid: number}>}
  */
 async function pollTransaction(server, txHash, options = {}) {
-  const pollLogger = options.logger || logger;
+  const _pollLogger = options.logger || logger;
   for (let i = 0; i < POLL_ATTEMPTS; i++) {
     const response = await server.getTransaction(txHash);
 
@@ -102,6 +102,7 @@ async function executeTaskOnce(
     xdr.Uint64.fromString(taskId.toString()),
   );
 
+  const transactionFeeMultiplier = config?.dynamicFeeMultiplier || Number(process.env.TRANSACTION_FEE_MULTIPLIER) || 1;
   const multiplier = Number(transactionFeeMultiplier) > 0 ? Number(transactionFeeMultiplier) : 1;
   const fee = Math.max(BASE_FEE, Math.round(BASE_FEE * multiplier));
   const tx = new TransactionBuilder(account, {
@@ -194,8 +195,7 @@ async function executeTaskOnce(
     );
   }
 
-  const { status, feePaid, ledger, closeTime } = await pollTransaction(server, sendResult.hash);
-  const { status, feePaid } = await pollTransaction(server, sendResult.hash, { logger: taskLogger });
+  const { status, feePaid, _ledger, _closeTime } = await pollTransaction(server, sendResult.hash, { logger: taskLogger });
   if (status === "FAILED") {
     recordLateness('failure');
     throw Object.assign(new Error("Transaction reached FAILED status"), {
@@ -256,7 +256,6 @@ async function executeTask(
       contractId,
       networkPassphrase,
       correlationId,
-      transactionFeeMultiplier: deps.dynamicFeeMultiplier,
       logger: taskLogger,
       dueTime,
       metricsServer,
@@ -268,18 +267,12 @@ async function executeTask(
     result.ledger = executionResult.ledger;
     result.closeTime = executionResult.closeTime;
 
-    if (deps.gasMonitor && typeof deps.gasMonitor.recordExecution === 'function') {
-      deps.gasMonitor.recordExecution(taskId, result.feePaid);
-    }
-
     taskLogger.info("Transaction finalised", {
       taskId,
       txHash: result.txHash,
-      status,
-      feePaid,
-      ledger: result.ledger,
       status: result.status,
       feePaid: result.feePaid,
+      ledger: result.ledger,
       correlationId,
     });
   } catch (err) {

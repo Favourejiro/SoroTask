@@ -30,59 +30,6 @@ function normalizeLogger(logger) {
  * based on last_run + interval <= current_ledger_timestamp.
  */
 class TaskPoller {
-   constructor(server, contractId, options = {}) {
-     this.server = server;
-     this.contractId = contractId;
-
-     // Structured logger for poller module
-     this.logger = options.logger || createLogger('poller');
-     this.metricsServer = options.metricsServer;
-
-     // Configuration with defaults
-     this.maxConcurrentReads = parseInt(
-       options.maxConcurrentReads || process.env.MAX_CONCURRENT_READS || 10,
-       10,
-     );
-     this.maxReadsPerSecond = parseInt(
-       options.maxReadsPerSecond || process.env.MAX_READS_PER_SECOND || 20,
-       10,
-     );
-
-     // Create rate limiter for parallel task reads
-     this.readLimit = createRateLimiter({
-       concurrency: this.maxConcurrentReads,
-       rps: this.maxReadsPerSecond,
-       logger: this.logger,
-       name: 'poller-reads',
-       onThrottle: (event) => {
-         if (this.metricsServer) {
-           this.metricsServer.increment('throttledRequestsTotal', { name: event.name });
-         }
-       },
-     });
-
-     // Statistics
-     this.stats = {
-       lastPollTime: null,
-       tasksChecked: 0,
-       tasksDue: 0,
-       tasksSkipped: 0,
-       errors: 0,
-     };
-
-     this.lastCycleInsights = {
-       backlogSize: 0,
-       dueCount: 0,
-       dueSoonCount: 0,
-       minSecondsUntilDue: null,
-       avgRpcLatencyMs: 0,
-       cycleDurationMs: 0,
-       errors: 0,
-     };
-
-     // Track last due task details for metrics
-     this.lastDueTaskDetails = []; // Array of { taskId, dueLedger }
-   }
   constructor(server, contractId, options = {}) {
     this.server = server;
     this.contractId = contractId;
@@ -164,6 +111,9 @@ class TaskPoller {
       cycleDurationMs: 0,
       errors: 0,
     };
+
+    // Track last due task details for metrics
+    this.lastDueTaskDetails = []; // Array of { taskId, dueLedger }
 
     // Cache for simulation results to avoid redundant RPC calls
     this.simulationCache = new SimulationCache({
@@ -328,14 +278,8 @@ class TaskPoller {
       // Collect due task IDs from successful checks
       const dueTaskIds = [];
       const dueTaskDetails = []; // Track due ledger for each task
+      const { includeContext = false } = options;
 
-      results.forEach((result, index) => {
-        if (result.status === 'fulfilled' && result.value) {
-          const { isDue, taskId, reason, nextRunTime } = result.value;
-
-          if (isDue) {
-            dueTaskIds.push(taskId);
-            dueTaskDetails.push({ taskId, dueLedger: nextRunTime });
       let warningDriftCount = 0;
       let criticalDriftCount = 0;
       let maxDriftSeconds = 0;
@@ -343,7 +287,7 @@ class TaskPoller {
 
       results.forEach((result, index) => {
         if (result.status === 'fulfilled') {
-          const { isDue, taskId, reason, correlationId } = result.value;
+          const { isDue, taskId, reason, _correlationId, nextRunTime } = result.value;
 
           if (isDue) {
             dueTaskIds.push(
@@ -351,6 +295,7 @@ class TaskPoller {
                 ? this.formatDueTask(result.value)
                 : taskId,
             );
+            dueTaskDetails.push({ taskId, dueLedger: nextRunTime });
             this.stats.tasksDue++;
             if (result.value.isUnacceptablyLate) {
               this.stats.unacceptablyLate++;
@@ -507,21 +452,14 @@ class TaskPoller {
   }
 
   /**
-      * Check a single task to determine if it's due for execution.
-      *
-      * @param {number} taskId - The task ID to check
-      * @param {number} currentTimestamp - Current ledger timestamp
-      * @returns {Promise<{isDue: boolean, taskId: number, reason?: string, secondsUntilDue: number|null, nextRunTime: number|null}>}
-      */
-  async checkTask(taskId, currentTimestamp, registry) {
-     * Check a single task to determine if it's due for execution.
-     *
-     * @param {number} taskId - The task ID to check
-     * @param {number} currentTimestamp - Current ledger timestamp
-     * @param {Object} [registry] - Optional task registry
-     * @param {Object} [options] - Additional options including correlationId
-     * @returns {Promise<{isDue: boolean, taskId: number, reason?: string, correlationId?: string}>}
-     */
+   * Check a single task to determine if it's due for execution.
+   *
+   * @param {number} taskId - The task ID to check
+   * @param {number} currentTimestamp - Current ledger timestamp
+   * @param {Object} [registry] - Optional task registry
+   * @param {Object} [options] - Additional options including correlationId
+   * @returns {Promise<{isDue: boolean, taskId: number, reason?: string, correlationId?: string}>}
+   */
   async checkTask(taskId, currentTimestamp, registry, options = {}) {
     const correlationId = options.correlationId;
     const taskLogger = correlationId 
@@ -1064,6 +1002,9 @@ class TaskPoller {
     */
   getLastDueTaskDetails() {
     return [...this.lastDueTaskDetails];
+  }
+
+  /**
    * Invalidate cached simulation data for one or more tasks.
    * Call this after a task is executed to ensure fresh data on next poll.
    *

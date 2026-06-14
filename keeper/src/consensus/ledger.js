@@ -90,7 +90,7 @@ class ConsensusLedger {
    */
   getTaskDecisions(taskId) {
     const decisions = [];
-    for (const [key, entry] of this.entries.entries()) {
+    for (const [_key, entry] of this.entries.entries()) {
       if (entry.taskId === taskId) {
         decisions.push(entry);
       }
@@ -152,7 +152,7 @@ class ConsensusLedger {
     try {
       const snapshot = {
         timestamp: Date.now(),
-        entries: Array.from(this.entries.entries()).map(([key, entry]) => entry),
+        entries: Array.from(this.entries.entries()).map(([_key, entry]) => entry),
       };
 
       fs.writeFileSync(this.snapshotPath, JSON.stringify(snapshot, null, 2));

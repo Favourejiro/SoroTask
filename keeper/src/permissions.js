@@ -1,6 +1,6 @@
 const crypto = require('crypto');
 class PermissionsEngine {
-  constructor({ auditLogger, storageDir } = {}) {
+  constructor({ auditLogger, _storageDir } = {}) {
     this.audit = auditLogger;
     this.grants = new Map(); // grantId -> grant
   }

@@ -257,7 +257,7 @@ class ChaosTestHarness {
       metrics.rpc_latency_ms = metrics.rpc_latency_ms || [];
       metrics.rpc_latency_ms.push(latency);
       
-    } catch (error) {
+    } catch (_error) {
       metrics.rpc_failures = (metrics.rpc_failures || 0) + 1;
       // Don't rethrow - we're testing resilience
     }

@@ -16,9 +16,6 @@
 //!   `env.mock_auths(&[...])` to approve only the *wrong* actor, which causes
 //!   the host to reject the `require_auth()` call for the *correct* actor.
 //!   The test then asserts the call returns an error via `try_*` methods.
-
-#![cfg(test)]
-
 use crate::{Error, SoroTaskContract, SoroTaskContractClient, TaskConfig};
 use soroban_sdk::{
     contract, contractimpl,
@@ -82,6 +79,7 @@ fn base_config(env: &Env, target: Address) -> TaskConfig {
         whitelist: Vec::new(env),
         is_active: true,
         blocked_by: Vec::new(env),
+        yield_strategy: None,
     }
 }
 
@@ -445,7 +443,7 @@ fn test_cancel_task_non_creator_rejected() {
 #[test]
 #[should_panic(expected = "Task not found")]
 fn test_cancel_task_edge_case_nonexistent_task() {
-    let (env, client) = setup_authed();
+    let (_, client) = setup_authed();
     client.cancel_task(&999_u64);
 }
 
@@ -568,6 +566,7 @@ fn test_update_task_cannot_transfer_ownership() {
         whitelist: Vec::new(&env),
         is_active: true,
         blocked_by: Vec::new(&env),
+        yield_strategy: None,
     };
 
     // update_task accesses storage, which requires running inside the contract

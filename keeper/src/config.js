@@ -44,7 +44,7 @@ function loadConfig() {
      );
    }
 
-   const pollIntervalMs = parseInt(process.env.POLLING_INTERVAL_MS, 10) || 10000;
+   const _pollIntervalMs = parseInt(process.env.POLLING_INTERVAL_MS, 10) || 10000;
 
   const rpcUrlList = parseList(process.env.SOROBAN_RPC_URLS);
   const rpcUrls = Array.from(new Set([
@@ -121,7 +121,7 @@ function loadConfig() {
     slaMaxRecentHistory: parseInteger(process.env.SLA_MAX_RECENT_HISTORY, 200),
     metricsResetOnStart: parseBoolean(process.env.METRICS_RESET_ON_START, false),
     p2p: {
-      enabled: p2pEnabled,
+      enabled: parseBoolean(process.env.P2P_ENABLED, false),
       nodeId: process.env.P2P_NODE_ID || null,
       publicUrl: process.env.P2P_PUBLIC_URL || null,
       listenHost: process.env.P2P_LISTEN_HOST || '0.0.0.0',
@@ -162,9 +162,9 @@ function loadConfig() {
     snapshotDir: process.env.SNAPSHOT_DIR || null,
     // Inbound Webhooks
     inboundWebhooks: {
-      enabled: inboundWebhooksEnabled,
+      enabled: parseBoolean(process.env.INBOUND_WEBHOOKS_ENABLED, false),
       path: process.env.INBOUND_WEBHOOK_PATH || '/webhooks/task-executions',
-      secret: inboundWebhookSecrets,
+      secret: process.env.INBOUND_WEBHOOK_SECRETS || null,
       defaultKeyId: process.env.INBOUND_WEBHOOK_DEFAULT_KEY_ID || 'primary',
       toleranceMs: parseInteger(process.env.INBOUND_WEBHOOK_TOLERANCE_MS, 300000),
       replayTtlMs: parseInteger(process.env.INBOUND_WEBHOOK_REPLAY_TTL_MS, 600000),

@@ -330,7 +330,7 @@ class SloMetrics {
    * @param {number}  [options.dueCount]   Tasks detected as due this cycle.
    * @param {number}  [options.nowMs]      Override for current timestamp (testing).
    */
-  recordPollCycle({ success, durationMs, taskCount = 0, dueCount = 0, nowMs = Date.now() }) {
+  recordPollCycle({ success, durationMs, _taskCount = 0, _dueCount = 0, nowMs = Date.now() }) {
     this.cntPolls.inc();
     this._totalPolls++;
 
@@ -371,7 +371,7 @@ class SloMetrics {
    * @param {string}  options.driftSeverity       'none' | 'warning' | 'critical' (from checkTask).
    * @param {boolean} options.isUnacceptablyLate  True when lateness > unacceptableLatenessSeconds.
    */
-  recordTaskLateness({ lateness, driftSeverity, isUnacceptablyLate }) {
+  recordTaskLateness({ lateness, _driftSeverity, isUnacceptablyLate }) {
     const l = Number.isFinite(lateness) ? Math.max(0, lateness) : 0;
 
     this.histLateness.observe(l);

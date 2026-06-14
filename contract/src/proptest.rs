@@ -96,14 +96,12 @@ proptest! {
                     let res = client.try_pause_task(&task_id);
                     prop_assert!(res.is_err());
                 }
+            } else if !expected_active {
+                client.resume_task(&task_id);
+                expected_active = true;
             } else {
-                if !expected_active {
-                    client.resume_task(&task_id);
-                    expected_active = true;
-                } else {
-                    let res = client.try_resume_task(&task_id);
-                    prop_assert!(res.is_err());
-                }
+                let res = client.try_resume_task(&task_id);
+                prop_assert!(res.is_err());
             }
 
             let retrieved = client.get_task(&task_id).unwrap();
@@ -146,14 +144,12 @@ proptest! {
             if is_deposit {
                 client.deposit_gas(&task_id, &creator, &amount);
                 expected_balance += amount;
+            } else if expected_balance >= amount {
+                client.withdraw_gas(&task_id, &amount);
+                expected_balance -= amount;
             } else {
-                if expected_balance >= amount {
-                    client.withdraw_gas(&task_id, &amount);
-                    expected_balance -= amount;
-                } else {
-                    let res = client.try_withdraw_gas(&task_id, &amount);
-                    prop_assert!(res.is_err());
-                }
+                let res = client.try_withdraw_gas(&task_id, &amount);
+                prop_assert!(res.is_err());
             }
 
             let retrieved = client.get_task(&task_id).unwrap();

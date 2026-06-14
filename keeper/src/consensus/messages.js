@@ -78,7 +78,7 @@ function createMessage(type, data, keeperId, secret) {
  */
 function signMessage(message, secret) {
   // Remove signature field for signing
-  const { signature, ...unsigned } = message;
+  const { _signature, ...unsigned } = message;
   const payload = JSON.stringify(unsigned);
   return crypto.createHmac('sha256', secret).update(payload).digest('hex');
 }

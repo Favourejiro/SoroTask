@@ -309,14 +309,14 @@ class MockSorobanRpcServer {
     return clone(this.defaultSimulationResponse);
   }
 
-  sendTransaction(params) {
+  sendTransaction(_params) {
     return {
       status: 'PENDING',
       hash: 'mock-tx-hash-' + Date.now() + '-' + Math.floor(Math.random() * 1000000)
     };
   }
 
-  getTransaction(params) {
+  getTransaction(_params) {
     return {
       status: 'SUCCESS',
       latestLedger: this.latestLedger.sequence,

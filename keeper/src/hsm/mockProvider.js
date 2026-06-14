@@ -32,7 +32,7 @@ class MockHSMProvider extends HSMProvider {
     return { keyId, publicPem: entry.publicPem, active: entry.active };
   }
 
-  async sign(keyId, data, options = {}) {
+  async sign(keyId, data, _options = {}) {
     const entry = this.keys.get(keyId);
     if (!entry) throw new Error('Key not found');
     if (!entry.active) throw new Error('Key not active');
@@ -47,7 +47,7 @@ class MockHSMProvider extends HSMProvider {
     return sign.sign(entry.privateKey);
   }
 
-  async rotateKey(keyId, options = {}) {
+  async rotateKey(keyId, _options = {}) {
     const entry = this.keys.get(keyId);
     if (!entry) throw new Error('Key not found');
     // simply generate new keypair and replace private/public, retaining keyId

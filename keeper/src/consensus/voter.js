@@ -135,7 +135,7 @@ class Voter {
     if (!session) return false;
     
     // Rejection quorum = more rejections than possible approvals
-    const maxPossibleApprovals = this.totalKeepers - session.rejectionCount;
+    const _maxPossibleApprovals = this.totalKeepers - session.rejectionCount;
     const reached = session.rejectionCount >= this.quorumSize;
     
     if (reached && session.status === 'PENDING') {

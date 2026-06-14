@@ -147,7 +147,7 @@ class ReconciliationEngine extends EventEmitter {
       return { accepted: false, reason: 'invalid_fee' };
     }
 
-    const state = this._getOrCreateTaskState(taskId);
+    const _state = this._getOrCreateTaskState(taskId);
     const pending = this.pendingExecutions.get(taskId) || [];
     const normalized = {
       taskId,

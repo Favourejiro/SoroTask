@@ -46,7 +46,7 @@ describe('Chaos Testing - Network and RPC Faults', () => {
     };
     
     chaosServer = new ChaosRpcServer(scenario.config);
-    const serverUrl = await chaosServer.start();
+    const _serverUrl = await chaosServer.start();
     
     // Create circuit breaker for testing
     const circuitBreaker = new CircuitBreaker('test-latency', {
@@ -66,7 +66,7 @@ describe('Chaos Testing - Network and RPC Faults', () => {
           return { success: true };
         });
         successCount++;
-      } catch (error) {
+      } catch (_error) {
         failureCount++;
       }
       
@@ -110,7 +110,7 @@ describe('Chaos Testing - Network and RPC Faults', () => {
       try {
         await wrappedServer.getNetwork();
         networkSuccess++;
-      } catch (error) {
+      } catch (_error) {
         // Should not fail
       }
       await new Promise(resolve => setTimeout(resolve, 200));
@@ -120,7 +120,7 @@ describe('Chaos Testing - Network and RPC Faults', () => {
     for (let i = 0; i < 5; i++) {
       try {
         await wrappedServer.simulateTransaction({});
-      } catch (error) {
+      } catch (_error) {
         simulationFailures++;
       }
       await new Promise(resolve => setTimeout(resolve, 200));
@@ -219,7 +219,7 @@ describe('Chaos Testing - Network and RPC Faults', () => {
         await circuitBreaker.execute(async () => {
           throw new Error('RPC failure (injected)');
         });
-      } catch (error) {
+      } catch (_error) {
         if (circuitBreaker.getState() === State.OPEN) {
           rejectedAfterTrip++;
         } else {
@@ -272,7 +272,7 @@ describe('Chaos Testing - Network and RPC Faults', () => {
     };
     
     try {
-      const result = await withRetry(testFunction, retryOptions);
+      const _result = await withRetry(testFunction, retryOptions);
       
       // Should not reach here - INVALID_ARGS is non-retryable
       expect(true).toBe(false);
@@ -404,7 +404,7 @@ describe('Chaos Testing - Network and RPC Faults', () => {
         
         const latency = Date.now() - startTime;
         updateHealth(true, latency);
-      } catch (error) {
+      } catch (_error) {
         updateHealth(false, 0);
       }
       

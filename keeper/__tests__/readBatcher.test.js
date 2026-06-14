@@ -65,7 +65,7 @@ function makeMockServer(responseFactory) {
  * A decoder that returns a simple object with an id field derived from the ScVal.
  * In real code this calls TaskPoller.decodeTaskConfig(scVal).
  */
-function makeDecoder(configs) {
+function _makeDecoder(_configs) {
   // configs: Map<taskId, object>
   return jest.fn(scVal => {
     // scVal is whatever we passed as configScVal in makeLedgerEntry

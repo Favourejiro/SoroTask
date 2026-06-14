@@ -317,7 +317,7 @@ class GracefulShutdownManager extends EventEmitter {
 
     // Wait for force timeout to allow graceful cancellation
     return new Promise((resolve) => {
-      const timeout = setTimeout(() => {
+      const _timeout = setTimeout(() => {
         const remaining = this._getInFlightTasks();
         if (remaining.length > 0) {
           this.logger.error("Force phase timeout: Tasks still in-flight", {
